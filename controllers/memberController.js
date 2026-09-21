@@ -1,15 +1,8 @@
-const fs = require("fs");
-const path = require("path");
 const { Member, AcademicYear } = require("../models");
-
-const fileToUrl = (file) => (file ? `/uploads/${file.filename}` : null);
-
-const removeFileIfAny = (url) => {
-  if (!url) return;
-  const filename = url.replace(/^\/uploads\//, "");
-  const full = path.join(__dirname, "..", "uploads", filename);
-  if (fs.existsSync(full)) fs.unlinkSync(full);
-};
+const {
+  uploadToCloudinary,
+  deleteFromCloudinary,
+} = require("../middlewares/upload");
 
 exports.list = async (req, res, next) => {
   try {
@@ -45,7 +38,9 @@ exports.getOne = async (req, res, next) => {
 exports.create = async (req, res, next) => {
   try {
     const payload = { ...req.body };
-    if (req.file) payload.photo_url = fileToUrl(req.file);
+    if (req.file) {
+      payload.photo_url = await uploadToCloudinary(req.file, "dic/members");
+    }
     if (payload.display_order !== undefined) {
       payload.display_order = parseInt(payload.display_order, 10) || 0;
     }
@@ -63,8 +58,8 @@ exports.update = async (req, res, next) => {
 
     const payload = { ...req.body };
     if (req.file) {
-      removeFileIfAny(member.photo_url);
-      payload.photo_url = fileToUrl(req.file);
+      await deleteFromCloudinary(member.photo_url);
+      payload.photo_url = await uploadToCloudinary(req.file, "dic/members");
     }
     if (payload.display_order !== undefined) {
       payload.display_order = parseInt(payload.display_order, 10) || 0;
@@ -81,7 +76,7 @@ exports.remove = async (req, res, next) => {
   try {
     const member = await Member.findByPk(req.params.id);
     if (!member) return res.status(404).json({ message: "Membre introuvable." });
-    removeFileIfAny(member.photo_url);
+    await deleteFromCloudinary(member.photo_url);
     await member.destroy();
     res.json({ message: "Membre supprime." });
   } catch (err) {

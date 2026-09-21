@@ -1,15 +1,8 @@
-const fs = require("fs");
-const path = require("path");
 const { GalleryPost, AcademicYear } = require("../models");
-
-const fileToUrl = (file) => (file ? `/uploads/${file.filename}` : null);
-
-const removeFileIfAny = (url) => {
-  if (!url) return;
-  const filename = url.replace(/^\/uploads\//, "");
-  const full = path.join(__dirname, "..", "uploads", filename);
-  if (fs.existsSync(full)) fs.unlinkSync(full);
-};
+const {
+  uploadToCloudinary,
+  deleteFromCloudinary,
+} = require("../middlewares/upload");
 
 exports.list = async (req, res, next) => {
   try {
@@ -22,7 +15,6 @@ exports.list = async (req, res, next) => {
       include: [{ model: AcademicYear, as: "academic_year" }],
       order: [["created_at", "DESC"]],
     };
-
     if (req.query.limit) options.limit = parseInt(req.query.limit, 10);
 
     const posts = await GalleryPost.findAll(options);
@@ -35,7 +27,9 @@ exports.list = async (req, res, next) => {
 exports.create = async (req, res, next) => {
   try {
     const payload = { ...req.body };
-    if (req.file) payload.image_url = fileToUrl(req.file);
+    if (req.file) {
+      payload.image_url = await uploadToCloudinary(req.file, "dic/gallery");
+    }
     if (!payload.academic_year_id) payload.academic_year_id = null;
     if (!payload.event_date) payload.event_date = null;
 
@@ -53,8 +47,8 @@ exports.update = async (req, res, next) => {
 
     const payload = { ...req.body };
     if (req.file) {
-      removeFileIfAny(post.image_url);
-      payload.image_url = fileToUrl(req.file);
+      await deleteFromCloudinary(post.image_url);
+      payload.image_url = await uploadToCloudinary(req.file, "dic/gallery");
     }
     if (!payload.academic_year_id) payload.academic_year_id = null;
     if (!payload.event_date) payload.event_date = null;
@@ -70,7 +64,7 @@ exports.remove = async (req, res, next) => {
   try {
     const post = await GalleryPost.findByPk(req.params.id);
     if (!post) return res.status(404).json({ message: "Photo introuvable." });
-    removeFileIfAny(post.image_url);
+    await deleteFromCloudinary(post.image_url);
     await post.destroy();
     res.json({ message: "Photo supprimee." });
   } catch (err) {

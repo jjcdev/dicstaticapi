@@ -1,21 +1,6 @@
 const multer = require("multer");
 const path = require("path");
-const fs = require("fs");
-
-const UPLOAD_DIR = path.join(__dirname, "..", "uploads");
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    const base = path
-      .basename(file.originalname, ext)
-      .replace(/[^a-z0-9_-]/gi, "_")
-      .slice(0, 40);
-    cb(null, `${Date.now()}_${base}${ext}`);
-  },
-});
+const cloudinary = require("../config/cloudinary");
 
 const fileFilter = (_req, file, cb) => {
   const allowed = ["image/jpeg", "image/png", "image/webp", "image/gif"];
@@ -25,8 +10,42 @@ const fileFilter = (_req, file, cb) => {
   cb(null, true);
 };
 
-module.exports = multer({
-  storage,
+const multerUpload = multer({
+  storage: multer.memoryStorage(),
   fileFilter,
   limits: { fileSize: 5 * 1024 * 1024 },
 });
+
+function uploadToCloudinary(file, folder = "dic-uploads") {
+  if (!file) return Promise.resolve(null);
+
+  return new Promise((resolve, reject) => {
+    const uploadStream = cloudinary.uploader.upload_stream(
+      {
+        folder,
+        resource_type: "image",
+        transformation: [{ quality: "auto:good", fetch_format: "auto" }],
+      },
+      (error, result) => {
+        if (error) return reject(error);
+        resolve(result.secure_url);
+      }
+    );
+    uploadStream.end(file.buffer);
+  });
+}
+
+function deleteFromCloudinary(fileUrl) {
+  if (!fileUrl || !fileUrl.includes("res.cloudinary.com")) {
+    return Promise.resolve();
+  }
+
+  const match = fileUrl.match(/\/upload\/(?:v\d+\/)?(.+?)(?:\.[a-z]+)?$/i);
+  if (!match) return Promise.resolve();
+
+  const publicId = match[1];
+
+  return cloudinary.uploader.destroy(publicId).catch(() => null);
+}
+
+module.exports = { multerUpload, uploadToCloudinary, deleteFromCloudinary };

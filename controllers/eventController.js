@@ -1,16 +1,9 @@
-const fs = require("fs");
-const path = require("path");
 const { Op } = require("sequelize");
 const { Event, AcademicYear } = require("../models");
-
-const fileToUrl = (file) => (file ? `/uploads/${file.filename}` : null);
-
-const removeFileIfAny = (url) => {
-  if (!url) return;
-  const filename = url.replace(/^\/uploads\//, "");
-  const full = path.join(__dirname, "..", "uploads", filename);
-  if (fs.existsSync(full)) fs.unlinkSync(full);
-};
+const {
+  uploadToCloudinary,
+  deleteFromCloudinary,
+} = require("../middlewares/upload");
 
 exports.list = async (req, res, next) => {
   try {
@@ -49,7 +42,9 @@ exports.getOne = async (req, res, next) => {
 exports.create = async (req, res, next) => {
   try {
     const payload = { ...req.body };
-    if (req.file) payload.cover_image = fileToUrl(req.file);
+    if (req.file) {
+      payload.cover_image = await uploadToCloudinary(req.file, "dic/events");
+    }
     if (!payload.academic_year_id) payload.academic_year_id = null;
 
     const event = await Event.create(payload);
@@ -66,8 +61,8 @@ exports.update = async (req, res, next) => {
 
     const payload = { ...req.body };
     if (req.file) {
-      removeFileIfAny(event.cover_image);
-      payload.cover_image = fileToUrl(req.file);
+      await deleteFromCloudinary(event.cover_image);
+      payload.cover_image = await uploadToCloudinary(req.file, "dic/events");
     }
     if (!payload.academic_year_id) payload.academic_year_id = null;
 
@@ -82,7 +77,7 @@ exports.remove = async (req, res, next) => {
   try {
     const event = await Event.findByPk(req.params.id);
     if (!event) return res.status(404).json({ message: "Evenement introuvable." });
-    removeFileIfAny(event.cover_image);
+    await deleteFromCloudinary(event.cover_image);
     await event.destroy();
     res.json({ message: "Evenement supprime." });
   } catch (err) {
