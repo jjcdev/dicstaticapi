@@ -3,6 +3,18 @@ const {
   uploadToCloudinary,
   deleteFromCloudinary,
 } = require("../middlewares/upload");
+const pick = require("../utils/pick");
+
+const ALLOWED_FIELDS = [
+  "first_name",
+  "last_name",
+  "role",
+  "bio",
+  "linkedin",
+  "github",
+  "display_order",
+  "academic_year_id",
+];
 
 exports.list = async (req, res, next) => {
   try {
@@ -37,7 +49,7 @@ exports.getOne = async (req, res, next) => {
 
 exports.create = async (req, res, next) => {
   try {
-    const payload = { ...req.body };
+    const payload = pick(req.body, ALLOWED_FIELDS);
     if (req.file) {
       payload.photo_url = await uploadToCloudinary(req.file, "dic/members");
     }
@@ -56,7 +68,7 @@ exports.update = async (req, res, next) => {
     const member = await Member.findByPk(req.params.id);
     if (!member) return res.status(404).json({ message: "Membre introuvable." });
 
-    const payload = { ...req.body };
+    const payload = pick(req.body, ALLOWED_FIELDS);
     if (req.file) {
       await deleteFromCloudinary(member.photo_url);
       payload.photo_url = await uploadToCloudinary(req.file, "dic/members");

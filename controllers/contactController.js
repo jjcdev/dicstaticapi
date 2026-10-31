@@ -1,13 +1,11 @@
 const { ContactMessage } = require("../models");
+const { validateContactMessage } = require("../utils/validators");
 
 exports.create = async (req, res, next) => {
   try {
-    const { name, email, subject, message } = req.body;
-    if (!name || !email || !subject || !message) {
-      return res.status(400).json({ message: "Tous les champs sont requis." });
-    }
-    const msg = await ContactMessage.create({ name, email, subject, message });
-    res.status(201).json({ id: msg.id, message: "Message envoye." });
+    const data = validateContactMessage(req.body);
+    const msg = await ContactMessage.create(data);
+    res.status(201).json({ id: msg.id, message: "Message envoyé." });
   } catch (err) {
     next(err);
   }
@@ -17,6 +15,7 @@ exports.list = async (_req, res, next) => {
   try {
     const messages = await ContactMessage.findAll({
       order: [["created_at", "DESC"]],
+      limit: 200,
     });
     res.json(messages);
   } catch (err) {
@@ -43,7 +42,7 @@ exports.remove = async (req, res, next) => {
     const msg = await ContactMessage.findByPk(req.params.id);
     if (!msg) return res.status(404).json({ message: "Message introuvable." });
     await msg.destroy();
-    res.json({ message: "Message supprime." });
+    res.json({ message: "Message supprimé." });
   } catch (err) {
     next(err);
   }

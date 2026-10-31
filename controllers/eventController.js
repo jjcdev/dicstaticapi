@@ -4,6 +4,15 @@ const {
   uploadToCloudinary,
   deleteFromCloudinary,
 } = require("../middlewares/upload");
+const pick = require("../utils/pick");
+
+const ALLOWED_FIELDS = [
+  "title",
+  "description",
+  "event_date",
+  "location",
+  "academic_year_id",
+];
 
 exports.list = async (req, res, next) => {
   try {
@@ -41,7 +50,7 @@ exports.getOne = async (req, res, next) => {
 
 exports.create = async (req, res, next) => {
   try {
-    const payload = { ...req.body };
+    const payload = pick(req.body, ALLOWED_FIELDS);
     if (req.file) {
       payload.cover_image = await uploadToCloudinary(req.file, "dic/events");
     }
@@ -59,12 +68,14 @@ exports.update = async (req, res, next) => {
     const event = await Event.findByPk(req.params.id);
     if (!event) return res.status(404).json({ message: "Evenement introuvable." });
 
-    const payload = { ...req.body };
+    const payload = pick(req.body, ALLOWED_FIELDS);
     if (req.file) {
       await deleteFromCloudinary(event.cover_image);
       payload.cover_image = await uploadToCloudinary(req.file, "dic/events");
     }
-    if (!payload.academic_year_id) payload.academic_year_id = null;
+    if (!payload.academic_year_id && payload.academic_year_id !== undefined) {
+      payload.academic_year_id = null;
+    }
 
     await event.update(payload);
     res.json(event);

@@ -3,6 +3,15 @@ const {
   uploadToCloudinary,
   deleteFromCloudinary,
 } = require("../middlewares/upload");
+const pick = require("../utils/pick");
+
+const ALLOWED_FIELDS = [
+  "title",
+  "description",
+  "category",
+  "event_date",
+  "academic_year_id",
+];
 
 exports.list = async (req, res, next) => {
   try {
@@ -26,7 +35,7 @@ exports.list = async (req, res, next) => {
 
 exports.create = async (req, res, next) => {
   try {
-    const payload = { ...req.body };
+    const payload = pick(req.body, ALLOWED_FIELDS);
     if (req.file) {
       payload.image_url = await uploadToCloudinary(req.file, "dic/gallery");
     }
@@ -45,13 +54,17 @@ exports.update = async (req, res, next) => {
     const post = await GalleryPost.findByPk(req.params.id);
     if (!post) return res.status(404).json({ message: "Photo introuvable." });
 
-    const payload = { ...req.body };
+    const payload = pick(req.body, ALLOWED_FIELDS);
     if (req.file) {
       await deleteFromCloudinary(post.image_url);
       payload.image_url = await uploadToCloudinary(req.file, "dic/gallery");
     }
-    if (!payload.academic_year_id) payload.academic_year_id = null;
-    if (!payload.event_date) payload.event_date = null;
+    if (!payload.academic_year_id && payload.academic_year_id !== undefined) {
+      payload.academic_year_id = null;
+    }
+    if (!payload.event_date && payload.event_date !== undefined) {
+      payload.event_date = null;
+    }
 
     await post.update(payload);
     res.json(post);
