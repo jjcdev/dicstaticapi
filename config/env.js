@@ -14,7 +14,7 @@ const required = ["JWT_SECRET", "DB_NAME", "DB_USER"];
 
 if (process.env.NODE_ENV === "production") {
   required.push(
-    "FRONTEND_ORIGIN",
+    "CORS_ORIGIN",
     "DB_HOST",
     "CLOUDINARY_CLOUD_NAME",
     "CLOUDINARY_API_KEY",
