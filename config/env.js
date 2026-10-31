@@ -44,7 +44,7 @@ if (
   process.exit(1);
 }
 
-const frontendOrigins = (process.env.FRONTEND_ORIGIN || "http://localhost:5173")
+const frontendOrigins = (process.env.CORS_ORIGIN || "http://localhost:5173")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
