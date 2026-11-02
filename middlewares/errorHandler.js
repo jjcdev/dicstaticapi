@@ -1,4 +1,5 @@
 const crypto = require("crypto");
+const AppError = require("../utils/AppError");
 
 const PROD = process.env.NODE_ENV === "production";
 
@@ -22,45 +23,44 @@ const isInvalidIdError = (err) =>
 
 module.exports = (err, req, res, _next) => {
   const requestId = crypto.randomUUID();
-  const status = err.status || err.statusCode;
 
-  // 1. Validation maison
+  // ─── 1. ValidationError (hérite de AppError, possède `fields`) ───
   if (err.name === "ValidationError" && err.fields) {
-    return res
-      .status(400)
-      .json({ message: err.message, errors: err.fields, requestId });
+    return res.status(400).json({
+      message: err.message || "Validation échouée.",
+      errors: err.fields,
+      requestId,
+    });
   }
 
-  // 2. Multer
+  // ─── 2. AppError générique (opérationnel, message sûr) ───
+  if (err instanceof AppError && err.isOperational) {
+    return res.status(err.statusCode).json({
+      message: err.message,
+      requestId,
+    });
+  }
+
+  // ─── 3. Multer ───
   if (err.name === "MulterError") {
     return res.status(400).json({ message: err.message, requestId });
   }
 
-  // 3. Messages contrôlés
-  const safeMessages = [
-    "Format d'image non supporte.",
-    "Origine CORS non autorisée.",
-  ];
-  if (safeMessages.includes(err.message)) {
-    const code = err.message.includes("CORS") ? 403 : 400;
-    return res.status(status || code).json({ message: err.message, requestId });
-  }
-
-  // 4. JSON malformé
-  if (err instanceof SyntaxError && status === 400) {
+  // ─── 4. JSON malformé ───
+  if (err instanceof SyntaxError && err.status === 400) {
     return res
       .status(400)
       .json({ message: "Corps de requête invalide (JSON attendu).", requestId });
   }
 
-  // 5. ID invalide (ex. /program/abc)
+  // ─── 5. ID invalide dans l'URL ───
   if (isInvalidIdError(err)) {
     return res
       .status(404)
       .json({ message: "Ressource introuvable.", requestId });
   }
 
-  // 6. Contrainte d'unicité
+  // ─── 6. Contrainte d'unicité Sequelize ───
   if (err.name === "SequelizeUniqueConstraintError") {
     const fields = err.fields || {};
     const safe = Object.keys(fields)
@@ -78,14 +78,14 @@ module.exports = (err, req, res, _next) => {
     });
   }
 
-  // 7. FK invalide (ex. academic_year_id inexistant)
+  // ─── 7. FK Sequelize ───
   if (err.name === "SequelizeForeignKeyConstraintError") {
     return res
       .status(400)
       .json({ message: "Référence invalide.", requestId });
   }
 
-  // 8. Validation Sequelize (NOT NULL, enum…)
+  // ─── 8. Validation Sequelize ───
   if (err.name === "SequelizeValidationError") {
     const message = PROD
       ? "Certaines valeurs sont invalides."
@@ -95,15 +95,19 @@ module.exports = (err, req, res, _next) => {
     return res.status(400).json({ message, requestId });
   }
 
-  // 9. 4xx explicites posés par un middleware
-  if (status >= 400 && status < 500) {
-    return res.status(status).json({
+  // ─── 9. Erreurs avec status numérique explicite (ex. body-parser) ───
+  const explicitStatus =
+    typeof err.status === "number" && err.status >= 400 && err.status < 500
+      ? err.status
+      : null;
+  if (explicitStatus) {
+    return res.status(explicitStatus).json({
       message: err.expose ? err.message : "Requête invalide.",
       requestId,
     });
   }
 
-  // 10. 500 générique — logs serveur uniquement
+  // ─── 10. 500 générique — logs serveur uniquement ───
   console.error(
     `[errorHandler ${requestId}] ${safeLog(req.method)} ` +
       `${safeLog(req.originalUrl)} → ` +

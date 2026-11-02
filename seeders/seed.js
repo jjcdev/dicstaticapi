@@ -1,41 +1,23 @@
+/**
+ * Seed minimal : garantit que la DB est synchronisée et qu'un admin existe.
+ *
+ * Utile en dev pour un premier démarrage rapide. En prod, `server.js`
+ * fait exactement la même chose au boot — ce script devient facultatif.
+ */
+
 require("dotenv").config();
-const bcrypt = require("bcryptjs");
-const { sequelize, Admin } = require("../models");
+const { sequelize } = require("../models");
+const { runStartupMigrations } = require("../config/databaseSync");
 
-const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "admin@dic.org";
-const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "admin";
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "AdminDIC2026";
-
-async function run() {
+(async () => {
   try {
     await sequelize.authenticate();
-    console.log("Connexion MySQL établie.");
-
-    await sequelize.sync();
-    console.log("Tables vérifiées.");
-
-    const existing = await Admin.findOne({ where: { email: ADMIN_EMAIL } });
-    if (existing) {
-      console.log("Admin déjà présent :", existing.email, "— aucune action.");
-      process.exit(0);
-    }
-
-    await Admin.create({
-      username: ADMIN_USERNAME,
-      email: ADMIN_EMAIL,
-      password: await bcrypt.hash(ADMIN_PASSWORD, 10),
-      role: "admin",
-    });
-
-    console.log("Compte admin créé :", ADMIN_EMAIL);
-    console.log(
-      "⚠️  Modifiez ADMIN_PASSWORD dans .env avant la mise en ligne."
-    );
+    console.log("Connexion DB établie.");
+    await runStartupMigrations();
+    console.log("Seed terminé.");
     process.exit(0);
   } catch (err) {
-    console.error("Erreur pendant le seed :", err);
+    console.error("Erreur pendant le seed :", err.message);
     process.exit(1);
   }
-}
-
-run();
+})();

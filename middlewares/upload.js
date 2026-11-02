@@ -1,11 +1,13 @@
 const multer = require("multer");
 const path = require("path");
 const cloudinary = require("../config/cloudinary");
+const AppError = require("../utils/AppError");
 
 const fileFilter = (_req, file, cb) => {
   const allowed = ["image/jpeg", "image/png", "image/webp", "image/gif"];
   if (!allowed.includes(file.mimetype)) {
-    return cb(new Error("Format d'image non supporte."));
+    // AppError → errorHandler renvoie 400 + message safe, pas 500
+    return cb(new AppError("Format d'image non supporte.", 400));
   }
   cb(null, true);
 };

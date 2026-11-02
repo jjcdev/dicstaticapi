@@ -4,8 +4,21 @@ const {
   sanitizeText,
   sanitizeRichText,
 } = require("./sanitize");
+const AppError = require("./AppError");
 
 const POLE_CANONICAL = ["ia", "cybersecurity", "robotics"];
+
+/* ──────── ValidationError : extension de AppError ──────── */
+
+class ValidationError extends AppError {
+  constructor(fields) {
+    super("Validation échouée.", 400);
+    this.name = "ValidationError";
+    this.fields = fields; // { champ: "message", ... }
+  }
+}
+
+/* ──────── Utilitaires de normalisation ──────── */
 
 const stripAccents = (s) =>
   s.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
@@ -41,15 +54,6 @@ const normalizePhonePrefix = (input) => {
   return `+${cleaned}`;
 };
 
-class ValidationError extends Error {
-  constructor(fields) {
-    super("Validation échouée.");
-    this.name = "ValidationError";
-    this.fields = fields;
-    this.status = 400;
-  }
-}
-
 const trim = (v) => (typeof v === "string" ? v.trim() : v);
 
 const normalizeEmail = (email) =>
@@ -76,7 +80,7 @@ const normalizeTime = (s) => {
 const isValidTime = (s) =>
   typeof s === "string" && /^([01]\d|2[0-3]):[0-5]\d$/.test(normalizeTime(s));
 
-/* ────────── Candidature ────────── */
+/* ──────── Candidature ──────── */
 
 const validateApplication = (body = {}) => {
   const fields = {};
@@ -128,12 +132,20 @@ const validateApplication = (body = {}) => {
   if (Object.keys(fields).length) throw new ValidationError(fields);
 
   return {
-    first_name, last_name, school, field_of_study, pole, email,
-    phone_prefix, phone_number, motivations, source,
+    first_name,
+    last_name,
+    school,
+    field_of_study,
+    pole,
+    email,
+    phone_prefix,
+    phone_number,
+    motivations,
+    source,
   };
 };
 
-/* ────────── Contact ────────── */
+/* ──────── Contact ──────── */
 
 const validateContactMessage = (body = {}) => {
   const fields = {};
@@ -160,7 +172,7 @@ const validateContactMessage = (body = {}) => {
   return { name, email, subject, message };
 };
 
-/* ────────── Règlement ────────── */
+/* ──────── Règlement ──────── */
 
 const validateRuleSection = (body = {}, { partial = false } = {}) => {
   const fields = {};
@@ -213,7 +225,7 @@ const validateRuleSection = (body = {}, { partial = false } = {}) => {
   return data;
 };
 
-/* ────────── Programme annuel ────────── */
+/* ──────── Programme annuel ──────── */
 
 const validateProgramItem = (body = {}, { partial = false } = {}) => {
   const fields = {};
@@ -372,7 +384,253 @@ const validateProgramItem = (body = {}, { partial = false } = {}) => {
   if (Object.keys(fields).length) throw new ValidationError(fields);
   return data;
 };
+/* ──────── Semaines (week_start = dimanche) ──────── */
 
+/**
+ * Normalise une date YYYY-MM-DD vers le dimanche de sa semaine.
+ * Ex : "2026-11-11" (mercredi) → "2026-11-08" (dimanche)
+ */
+const normalizeToSunday = (dateStr) => {
+  if (!isValidDate(dateStr)) return null;
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  const day = d.getUTCDay(); // 0 = dimanche
+  d.setUTCDate(d.getUTCDate() - day);
+  return d.toISOString().slice(0, 10);
+};
+
+/**
+ * Dimanche de la semaine courante (UTC).
+ */
+const currentWeekSunday = () => {
+  const now = new Date();
+  const day = now.getUTCDay();
+  const d = new Date(now);
+  d.setUTCDate(d.getUTCDate() - day);
+  d.setUTCHours(0, 0, 0, 0);
+  return d.toISOString().slice(0, 10);
+};
+
+/**
+ * Ajoute n jours à une date YYYY-MM-DD.
+ */
+const addDays = (dateStr, n) => {
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+};
+
+/* ──────── WeeklySchedule ──────── */
+
+const validateWeeklySchedulePayload = (body = {}) => {
+  const fields = {};
+  const data = {};
+
+  if (!body.workshop_id || typeof body.workshop_id !== "string") {
+    fields.workshop_id = "workshop_id requis.";
+  } else {
+    data.workshop_id = body.workshop_id;
+  }
+
+  const week_start = normalizeToSunday(body.week_start);
+  if (!week_start) {
+    fields.week_start = "week_start invalide (YYYY-MM-DD attendu).";
+  } else if (week_start < currentWeekSunday()) {
+    fields.week_start = "Impossible de créer un planning pour une semaine passée.";
+  } else {
+    data.week_start = week_start;
+  }
+
+  if (Object.keys(fields).length) throw new ValidationError(fields);
+  return data;
+};
+
+/* ──────── WeeklyScheduleSlot ──────── */
+
+const validateSlotPayload = (body = {}, { partial = false } = {}) => {
+  const fields = {};
+  const data = {};
+
+  if (body.day_of_week !== undefined || !partial) {
+    const dow = parseInt(body.day_of_week, 10);
+    if (!Number.isInteger(dow) || dow < 0 || dow > 6) {
+      fields.day_of_week = "day_of_week doit être entre 0 (dim.) et 6 (sam.).";
+    } else {
+      data.day_of_week = dow;
+    }
+  }
+
+  if (body.start_time !== undefined || !partial) {
+    const t = normalizeTime(body.start_time);
+    if (!isValidTime(t)) {
+      fields.start_time = "start_time invalide (HH:MM).";
+    } else {
+      data.start_time = t;
+    }
+  }
+
+  if (body.end_time !== undefined || !partial) {
+    const t = normalizeTime(body.end_time);
+    if (!isValidTime(t)) {
+      fields.end_time = "end_time invalide (HH:MM).";
+    } else {
+      data.end_time = t;
+    }
+  }
+
+  if (data.start_time && data.end_time && data.end_time <= data.start_time) {
+    fields.end_time = "end_time doit être > start_time.";
+  }
+
+  if (body.title !== undefined || !partial) {
+    const title = sanitizeLine(trim(body.title));
+    if (!title || title.length > 160) {
+      fields.title = "Titre requis (max 160 caractères).";
+    } else {
+      data.title = title;
+    }
+  }
+
+  if (body.location !== undefined) {
+    if (body.location === null || body.location === "") {
+      data.location = null;
+    } else {
+      const loc = sanitizeLine(String(body.location));
+      if (loc.length > 160) {
+        fields.location = "Lieu trop long (max 160).";
+      } else {
+        data.location = loc || null;
+      }
+    }
+  }
+
+  if (body.room !== undefined) {
+    if (body.room === null || body.room === "") {
+      data.room = null;
+    } else {
+      const room = sanitizeLine(String(body.room));
+      if (room.length > 120) {
+        fields.room = "Salle trop longue (max 120).";
+      } else {
+        data.room = room || null;
+      }
+    }
+  }
+
+  if (body.display_order !== undefined) {
+    const order = parseInt(body.display_order, 10);
+    if (!Number.isInteger(order) || order < 0) {
+      fields.display_order = "display_order doit être ≥ 0.";
+    } else {
+      data.display_order = order;
+    }
+  }
+
+  if (Object.keys(fields).length) throw new ValidationError(fields);
+  return data;
+};
+/* ──────── SessionReport ──────── */
+
+const validateReportPayload = (body = {}, { partial = false } = {}) => {
+  const fields = {};
+  const data = {};
+
+  if (body.workshop_id !== undefined || !partial) {
+    if (!body.workshop_id || typeof body.workshop_id !== "string") {
+      fields.workshop_id = "workshop_id requis.";
+    } else {
+      data.workshop_id = body.workshop_id;
+    }
+  }
+
+  if (body.date !== undefined || !partial) {
+    if (!isValidDate(body.date)) {
+      fields.date = "date invalide (YYYY-MM-DD).";
+    } else {
+      const today = new Date().toISOString().slice(0, 10);
+      if (body.date > today) {
+        fields.date = "Impossible de créer un rapport pour une date future.";
+      } else {
+        data.date = body.date;
+      }
+    }
+  }
+
+  for (const key of ["activities", "concepts", "takeaways"]) {
+    if (body[key] !== undefined) {
+      if (body[key] === null || body[key] === "") {
+        data[key] = null;
+      } else {
+        const t = sanitizeText(String(body[key]));
+        if (t.length > 10000) {
+          fields[key] = `${key} trop long (max 10000).`;
+        } else {
+          data[key] = t || null;
+        }
+      }
+    }
+  }
+
+  if (body.client_id !== undefined) {
+    if (body.client_id === null || body.client_id === "") {
+      data.client_id = null;
+    } else if (
+      typeof body.client_id !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+        body.client_id
+      )
+    ) {
+      fields.client_id = "client_id doit être un UUID.";
+    } else {
+      data.client_id = body.client_id;
+    }
+  }
+
+  if (body.client_created_at !== undefined) {
+    if (body.client_created_at === null || body.client_created_at === "") {
+      data.client_created_at = null;
+    } else {
+      const d = new Date(body.client_created_at);
+      if (isNaN(d.getTime())) {
+        fields.client_created_at = "client_created_at invalide.";
+      } else if (d.getTime() > Date.now() + 5 * 60 * 1000) {
+        fields.client_created_at = "client_created_at ne peut pas être dans le futur.";
+      } else {
+        data.client_created_at = d;
+      }
+    }
+  }
+
+  if (Object.keys(fields).length) throw new ValidationError(fields);
+  return data;
+};
+
+const validateAttendeeEntry = (entry = {}) => {
+  const fields = {};
+  const data = {};
+
+  if (!entry.student_id || typeof entry.student_id !== "string") {
+    fields.student_id = "student_id requis.";
+  } else {
+    data.student_id = entry.student_id;
+  }
+
+  const status = entry.status === "present" ? "present" : "absent";
+  data.status = status;
+
+  if (status === "absent" && entry.absence_reason) {
+    const reason = sanitizeText(String(entry.absence_reason));
+    if (reason.length > 1000) {
+      fields.absence_reason = "Raison trop longue (max 1000).";
+    } else {
+      data.absence_reason = reason || null;
+    }
+  } else {
+    data.absence_reason = null;
+  }
+
+  if (Object.keys(fields).length) throw new ValidationError(fields);
+  return data;
+};
 module.exports = {
   POLE_CANONICAL,
   ValidationError,
@@ -388,4 +646,11 @@ module.exports = {
   validateContactMessage,
   validateRuleSection,
   validateProgramItem,
+  normalizeToSunday,
+currentWeekSunday,
+addDays,
+validateWeeklySchedulePayload,
+validateSlotPayload,
+validateReportPayload,
+validateAttendeeEntry,
 };

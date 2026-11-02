@@ -43,6 +43,12 @@ module.exports = (sequelize, DataTypes) =>
         type: DataTypes.INTEGER,
         allowNull: false,
       },
+      // Lien optionnel vers un compte mobile (User).
+      // NULL = membre vitrine sans compte (peut exister indéfiniment).
+      user_id: {
+        type: DataTypes.UUID,
+        allowNull: true,
+      },
     },
     {
       tableName: "members",

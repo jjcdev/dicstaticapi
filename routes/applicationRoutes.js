@@ -1,14 +1,14 @@
 const router = require("express").Router();
 const ctrl = require("../controllers/applicationController");
-const { protect } = require("../middlewares/authMiddleware");
+const { protectAdmin } = require("../middlewares/authMiddleware");
 const { applicationIpLimiter } = require("../middlewares/rateLimit");
 
-// Public (avec throttling)
+// Public
 router.post("/", applicationIpLimiter, ctrl.create);
 
-// Admin
-router.get("/", protect, ctrl.list);
-router.get("/:id", protect, ctrl.getOne);
-router.delete("/:id", protect, ctrl.remove);
+// Admin — protectAdmin obligatoire
+router.get("/", protectAdmin, ctrl.list);
+router.get("/:id", protectAdmin, ctrl.getOne);
+router.delete("/:id", protectAdmin, ctrl.remove);
 
 module.exports = router;

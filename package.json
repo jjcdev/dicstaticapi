@@ -11,7 +11,32 @@
   "author": "",
   "license": "ISC",
   "description": "",
-  "dependencies": {
+   "nodemonConfig": {
+    "watch": [
+      "server.js",
+      "app.js",
+      "config",
+      "controllers",
+      "models",
+      "routes",
+      "middlewares",
+      "utils",
+      "seeders",
+      "scripts"
+    ],
+    "ignore": [
+      "backups/*",
+      "*.sql",
+      "*.md",
+      "tests/*",
+      "logs/*",
+      ".env",
+      ".env.*",
+      "node_modules",
+      "package*.json"
+    ],
+    "delay": 1000},
+      "dependencies": {
     "bcryptjs": "^3.0.3",
     "cloudinary": "^2.11.0",
     "cors": "^2.8.6",
