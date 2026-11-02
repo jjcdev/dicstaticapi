@@ -3,13 +3,17 @@
  *
  * Étapes (dans l'ordre) :
  *   1. Crée les tables manquantes
- *   2. Ajoute les colonnes manquantes (NULLABLE si NOT NULL sans default)
- *   3. Étend les ENUM MySQL si de nouvelles valeurs apparaissent
- *   4. Détecte les tables orphelines (en DB, absentes des modèles)
- *      → Supprime conditionnellement selon DB_DROP_ORPHAN_TABLES
- *   5. Détecte les anomalies (colonnes orphelines, mismatches de type)
+ *   2. Ajoute les colonnes manquantes (sans FK d'abord, puis FK séparément)
+ *   3. Étend les ENUM MySQL/TiDB si de nouvelles valeurs apparaissent
+ *   4. Détecte les tables orphelines → drop conditionnel
+ *   5. Détecte les anomalies (colonnes orphelines, FK manquantes)
  *   6. Migre les Admin legacy → User
  *   7. Crée l'admin par défaut si aucun n'existe
+ *
+ * Gestion des FK :
+ *   - addColumn SANS references (bug connu Sequelize sur MySQL/TiDB)
+ *   - addConstraint APRÈS, avec check idempotent via information_schema
+ *   - TiDB : si tidb_enable_foreign_key=OFF, on warn et on n'essaie pas
  *
  * Modes :
  *   safe   (défaut) : applique tout ce qui est safe, warn le reste
@@ -18,9 +22,8 @@
  *   alter           : Sequelize alter (dev uniquement, peut supprimer)
  *
  * Suppression de tables orphelines :
- *   DB_DROP_ORPHAN_TABLES=true        → active le drop (tables vides uniquement)
- *   DB_FORCE_DROP_NON_EMPTY=true      → autorise le drop des tables non vides
- *                                       (backup SQL automatique dans backups/)
+ *   DB_DROP_ORPHAN_TABLES=true        → active le drop (tables vides)
+ *   DB_FORCE_DROP_NON_EMPTY=true      → autorise le drop non vide (backup auto)
  *
  * Tables système JAMAIS touchées :
  *   SequelizeMeta, sequelize_meta, _migrations, sqlite_sequence
@@ -42,7 +45,6 @@ const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "admin@dic.org";
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "admin";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "AdminDIC2026";
 
-// Tables système à ne JAMAIS toucher
 const PROTECTED_TABLES = new Set([
   "SequelizeMeta",
   "sequelize_meta",
@@ -68,7 +70,93 @@ function getModels() {
   return require("../models");
 }
 
-/* ──────────── 1. Tables ──────────── */
+/* ═══════════════════════════════════════════════════════════
+   Helpers DB (dialect-aware)
+   ═══════════════════════════════════════════════════════════ */
+
+/**
+ * Quote un identifiant selon le dialecte.
+ * MySQL/TiDB → `xxx`
+ * Postgres    → "xxx"
+ */
+function quoteIdent(name) {
+  const dialect = sequelize.getDialect();
+  if (dialect === "postgres") {
+    return `"${String(name).replace(/"/g, '""')}"`;
+  }
+  return `\`${String(name).replace(/`/g, "``")}\``;
+}
+
+/**
+ * Récupère la liste des tables réelles via information_schema.
+ * Plus fiable que sequelize.getQueryInterface().showAllTables().
+ */
+async function listTables() {
+  const dialect = sequelize.getDialect();
+  let rows;
+
+  if (dialect === "postgres") {
+    [rows] = await sequelize.query(
+      `SELECT table_name FROM information_schema.tables
+       WHERE table_schema = 'public' AND table_type = 'BASE TABLE'`
+    );
+    return rows.map((r) => r.table_name);
+  }
+
+  // mysql / tidb / mariadb
+  [rows] = await sequelize.query(
+    `SELECT table_name FROM information_schema.tables
+     WHERE table_schema = DATABASE()`
+  );
+  return rows.map((r) => r.table_name || r.TABLE_NAME);
+}
+
+/**
+ * Vérifie si une FK existe déjà (idempotence).
+ */
+async function fkExists(tableName, constraintName) {
+  const dialect = sequelize.getDialect();
+  let rows;
+
+  if (dialect === "postgres") {
+    [rows] = await sequelize.query(
+      `SELECT constraint_name FROM information_schema.table_constraints
+       WHERE table_name = :table AND constraint_name = :name`,
+      { replacements: { table: tableName, name: constraintName } }
+    );
+  } else {
+    [rows] = await sequelize.query(
+      `SELECT constraint_name FROM information_schema.table_constraints
+       WHERE table_schema = DATABASE()
+         AND table_name = :table
+         AND constraint_name = :name`,
+      { replacements: { table: tableName, name: constraintName } }
+    );
+  }
+
+  return rows.length > 0;
+}
+
+/**
+ * Vérifie si TiDB a les FK activées (OFF par défaut sur TiDB Cloud).
+ */
+async function tidbForeignKeysEnabled() {
+  if (sequelize.getDialect() !== "mysql") return true;
+  try {
+    const [rows] = await sequelize.query(
+      `SHOW VARIABLES LIKE 'tidb_enable_foreign_key'`
+    );
+    if (!rows || rows.length === 0) return true; // pas TiDB, c'est MySQL normal
+    const val = rows[0].Value || rows[0].value;
+    return val === "1" || val === "ON" || val === "on";
+  } catch {
+    return true;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════
+   1. Tables
+   ═══════════════════════════════════════════════════════════ */
 
 async function ensureTables() {
   const qi = sequelize.getQueryInterface();
@@ -87,18 +175,24 @@ async function ensureTables() {
   return created;
 }
 
-/* ──────────── 2. Colonnes ──────────── */
+/* ═══════════════════════════════════════════════════════════
+   2. Colonnes + FK (séparément — fix MySQL/TiDB)
+   ═══════════════════════════════════════════════════════════ */
 
 async function ensureColumns() {
   const qi = sequelize.getQueryInterface();
   const underscored = sequelize.options.define?.underscored === true;
+  const allTables = await listTables();
+  const fkEnabled = await tidbForeignKeysEnabled();
+
   let added = 0;
+  let fkAdded = 0;
+  let fkSkipped = 0;
 
   for (const [, model] of Object.entries(sequelize.models)) {
     const rawTable = model.getTableName();
     const tableName = typeof rawTable === "string" ? rawTable : rawTable.tableName;
-
-    if (!(await qi.tableExists(tableName))) continue;
+    if (!allTables.includes(tableName)) continue;
 
     const dbCols = await qi.describeTable(tableName);
     const modelAttrs = model.rawAttributes;
@@ -106,34 +200,98 @@ async function ensureColumns() {
     for (const [attrName, attr] of Object.entries(modelAttrs)) {
       if (attr.type && attr.type.key === "VIRTUAL") continue;
       const colName = expectedColumnName(attrName, attr, underscored);
-      if (dbCols[colName]) continue;
 
-      const safeAttr = { ...attr };
-      if (
-        safeAttr.allowNull === false &&
-        safeAttr.defaultValue === undefined &&
-        safeAttr.autoIncrement !== true
-      ) {
-        safeAttr.allowNull = true;
+      // ─── 2a. Ajouter la colonne SI elle manque (SANS FK) ───
+      if (!dbCols[colName]) {
+        const colAttr = {
+          type: attr.type,
+          allowNull: true, // toujours nullable à la création, resserré ensuite
+          defaultValue: attr.defaultValue,
+          comment: attr.comment,
+        };
+
+        if (
+          attr.allowNull === false &&
+          attr.defaultValue === undefined &&
+          attr.autoIncrement !== true
+        ) {
+          warn(
+            `${tableName}.${colName} ajoutée NULLABLE ` +
+              `(NOT NULL sans default — remplir puis passer en NOT NULL manuellement)`
+          );
+        }
+
+        try {
+          await qi.addColumn(tableName, colName, colAttr);
+          console.log(`  [+] ${tableName}.${colName} ajoutée`);
+          added++;
+        } catch (err) {
+          warn(`${tableName}.${colName} : échec d'ajout (${err.message})`);
+          continue;
+        }
+      }
+
+      // ─── 2b. Ajouter la FK SI déclarée et si la cible existe ───
+      if (!attr.references) continue;
+
+      const refTable =
+        typeof attr.references.model === "string"
+          ? attr.references.model
+          : attr.references.model.tableName;
+
+      if (!allTables.includes(refTable)) {
+        // La table cible n'existe pas encore → reporté au prochain boot
+        continue;
+      }
+
+      if (!fkEnabled) {
         warn(
-          `${tableName}.${colName} ajoutée NULLABLE ` +
-            `(NOT NULL sans default — remplir puis passer en NOT NULL manuellement)`
+          `${tableName}.${colName} FK ignorée ` +
+            `(TiDB : tidb_enable_foreign_key=OFF)`
         );
+        fkSkipped++;
+        continue;
+      }
+
+      const fkName = `${tableName}_${colName}_fk`;
+
+      if (await fkExists(tableName, fkName)) {
+        continue; // déjà présente
       }
 
       try {
-        await qi.addColumn(tableName, colName, safeAttr);
-        console.log(`  [+] ${tableName}.${colName} ajoutée`);
-        added++;
+        await qi.addConstraint(tableName, {
+          type: "foreign key",
+          fields: [colName],
+          name: fkName,
+          references: {
+            table: refTable,
+            field: attr.references.key || "id",
+          },
+          onDelete: attr.onDelete || "SET NULL",
+          onUpdate: attr.onUpdate || "CASCADE",
+        });
+        console.log(`  [+] ${tableName}.${colName} FK → ${refTable}`);
+        fkAdded++;
       } catch (err) {
-        warn(`${tableName}.${colName} : échec d'ajout (${err.message})`);
+        // Cas bénins : FK déjà existante sous un autre nom, contraintes système
+        if (
+          !/Duplicate foreign key|already exists|errno: 121|ER_FK_DUP_NAME/i.test(
+            err.message
+          )
+        ) {
+          warn(`${tableName}.${colName} FK : ${err.message}`);
+        }
       }
     }
   }
-  return added;
+
+  return { added, fkAdded, fkSkipped };
 }
 
-/* ──────────── 3. Extension des ENUM (MySQL) ──────────── */
+/* ═══════════════════════════════════════════════════════════
+   3. Extension des ENUM (MySQL / TiDB)
+   ═══════════════════════════════════════════════════════════ */
 
 async function ensureEnumColumns() {
   const dialect = sequelize.getDialect();
@@ -171,7 +329,9 @@ async function ensureEnumColumns() {
 
       try {
         const allValues = [...new Set([...dbValues, ...modelValues])];
-        const enumDef = allValues.map((v) => `'${v.replace(/'/g, "''")}'`).join(",");
+        const enumDef = allValues
+          .map((v) => `'${v.replace(/'/g, "''")}'`)
+          .join(",");
         const nullSql = attr.allowNull === false ? "NOT NULL" : "NULL";
         let defaultSql = "";
         if (attr.defaultValue !== undefined && attr.defaultValue !== null) {
@@ -180,8 +340,9 @@ async function ensureEnumColumns() {
         }
 
         await sequelize.query(
-          `ALTER TABLE \`${tableName}\` MODIFY COLUMN \`${colName}\` ` +
-            `ENUM(${enumDef}) ${nullSql}${defaultSql}`
+          `ALTER TABLE ${quoteIdent(tableName)} MODIFY COLUMN ${quoteIdent(
+            colName
+          )} ENUM(${enumDef}) ${nullSql}${defaultSql}`
         );
         console.log(
           `  [+] ${tableName}.${colName} ENUM étendu (+${missingInDb.join(", ")})`
@@ -195,15 +356,12 @@ async function ensureEnumColumns() {
   return updated;
 }
 
-/* ──────────── 4. Détection + suppression des tables orphelines ──────────── */
+/* ═══════════════════════════════════════════════════════════
+   4. Tables orphelines (drop conditionnel + backup)
+   ═══════════════════════════════════════════════════════════ */
 
-/**
- * Retourne la liste des tables présentes en DB mais absentes des modèles.
- * Ignore les tables système.
- */
 async function getOrphanTables() {
-  const qi = sequelize.getQueryInterface();
-  const allTables = await qi.showAllTables();
+  const allTables = await listTables();
 
   const knownTables = new Set();
   for (const [, model] of Object.entries(sequelize.models)) {
@@ -211,55 +369,41 @@ async function getOrphanTables() {
     knownTables.add(typeof rawTable === "string" ? rawTable : rawTable.tableName);
   }
 
-  const orphans = [];
-  for (const raw of allTables) {
-    const name = typeof raw === "string" ? raw : raw.tableName || raw.TABLE_NAME || raw.name;
-    if (!name) continue;
-    if (PROTECTED_TABLES.has(name)) continue;
-    if (knownTables.has(name)) continue;
-    orphans.push(name);
-  }
-  return orphans;
+  return allTables.filter(
+    (name) => !PROTECTED_TABLES.has(name) && !knownTables.has(name)
+  );
 }
 
-/**
- * Compte les lignes d'une table.
- */
 async function countRows(tableName) {
   try {
-    const [result] = await sequelize.query(
-      `SELECT COUNT(*) AS count FROM \`${tableName}\``
+    const [rows] = await sequelize.query(
+      `SELECT COUNT(*) AS count FROM ${quoteIdent(tableName)}`
     );
-    return Number(result?.[0]?.count ?? 0);
+    return Number(rows?.[0]?.count ?? rows?.[0]?.COUNT ?? 0);
   } catch {
     return 0;
   }
 }
 
-/**
- * Backup une table en SQL dans backups/<timestamp>_<table>.sql
- * Retourne le chemin du fichier ou null si erreur.
- */
 async function backupTable(tableName) {
   try {
     if (!fs.existsSync(BACKUP_DIR)) {
       fs.mkdirSync(BACKUP_DIR, { recursive: true });
     }
 
-    const rows = await sequelize.query(`SELECT * FROM \`${tableName}\``, {
-      type: sequelize.QueryTypes.SELECT,
-    });
+    const rows = await sequelize.query(
+      `SELECT * FROM ${quoteIdent(tableName)}`,
+      { type: sequelize.QueryTypes.SELECT }
+    );
 
-    if (!rows || rows.length === 0) {
-      return null;
-    }
+    if (!rows || rows.length === 0) return null;
 
     const ts = new Date().toISOString().replace(/[:.]/g, "-");
     const filePath = path.join(BACKUP_DIR, `${ts}_${tableName}.sql`);
 
     const columns = Object.keys(rows[0]);
     const lines = [
-      `-- Backup automatique de la table \`${tableName}\``,
+      `-- Backup automatique de la table ${quoteIdent(tableName)}`,
       `-- Date : ${new Date().toISOString()}`,
       `-- Lignes : ${rows.length}`,
       ``,
@@ -275,8 +419,9 @@ async function backupTable(tableName) {
         return `'${String(v).replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`;
       });
       lines.push(
-        `INSERT INTO \`${tableName}\` (${columns.map((c) => `\`${c}\``).join(", ")}) ` +
-          `VALUES (${values.join(", ")});`
+        `INSERT INTO ${quoteIdent(tableName)} (${columns
+          .map(quoteIdent)
+          .join(", ")}) VALUES (${values.join(", ")});`
       );
     }
 
@@ -288,12 +433,8 @@ async function backupTable(tableName) {
   }
 }
 
-/**
- * Détecte les tables orphelines et les supprime conditionnellement.
- */
 async function handleOrphanTables() {
   const orphans = await getOrphanTables();
-
   if (orphans.length === 0) {
     return { detected: 0, dropped: 0, warned: 0 };
   }
@@ -307,7 +448,6 @@ async function handleOrphanTables() {
     const count = await countRows(table);
     const isEmpty = count === 0;
 
-    // Cas 1 : mode warn (défaut) — on ne supprime jamais
     if (!DROP_ORPHAN) {
       warn(
         `table orpheline "${table}" (${count} ligne(s)) — ` +
@@ -317,7 +457,6 @@ async function handleOrphanTables() {
       continue;
     }
 
-    // Cas 2 : DROP_ORPHAN=true mais table NON vide et FORCE_DROP_NON_EMPTY=false
     if (!isEmpty && !FORCE_DROP_NON_EMPTY) {
       warn(
         `table orpheline "${table}" (${count} ligne(s)) — ` +
@@ -327,23 +466,22 @@ async function handleOrphanTables() {
       continue;
     }
 
-    // Cas 3 : suppression autorisée
     let backupPath = null;
     if (!isEmpty) {
       console.log(`  [~] backup de "${table}" (${count} ligne(s))...`);
       backupPath = await backupTable(table);
       if (!backupPath) {
         warn(
-          `table orpheline "${table}" — backup échoué, suppression ANNULÉE par sécurité`
+          `table orpheline "${table}" — backup échoué, suppression ANNULÉE`
         );
         warned++;
         continue;
       }
-      console.log(`  [✓] backup sauvegardé : ${path.relative(process.cwd(), backupPath)}`);
+      console.log(`  [✓] backup : ${path.relative(process.cwd(), backupPath)}`);
     }
 
     try {
-      await sequelize.query(`DROP TABLE \`${table}\``);
+      await sequelize.query(`DROP TABLE ${quoteIdent(table)}`);
       console.log(
         `  [+] table orpheline supprimée : ${table}` +
           (backupPath ? ` (backup : ${path.basename(backupPath)})` : " (vide)")
@@ -358,7 +496,9 @@ async function handleOrphanTables() {
   return { detected: orphans.length, dropped, warned };
 }
 
-/* ──────────── 5. Anomalies (colonnes orphelines) ──────────── */
+/* ═══════════════════════════════════════════════════════════
+   5. Anomalies (colonnes orphelines)
+   ═══════════════════════════════════════════════════════════ */
 
 async function detectAnomalies() {
   const qi = sequelize.getQueryInterface();
@@ -390,7 +530,9 @@ async function detectAnomalies() {
   return anomalies;
 }
 
-/* ──────────── 6. Migration legacy Admin → User ──────────── */
+/* ═══════════════════════════════════════════════════════════
+   6. Migration Admin legacy → User
+   ═══════════════════════════════════════════════════════════ */
 
 async function migrateLegacyAdmins() {
   if (!AUTO_MIGRATE_LEGACY) {
@@ -418,10 +560,16 @@ async function migrateLegacyAdmins() {
 
   for (const admin of admins) {
     const existing = await User.findOne({ where: { email: admin.email } });
-    if (existing) { skipped++; continue; }
+    if (existing) {
+      skipped++;
+      continue;
+    }
 
     const legacy = await User.findOne({ where: { legacy_admin_id: admin.id } });
-    if (legacy) { skipped++; continue; }
+    if (legacy) {
+      skipped++;
+      continue;
+    }
 
     await User.create(
       {
@@ -442,7 +590,9 @@ async function migrateLegacyAdmins() {
   return { created, skipped };
 }
 
-/* ──────────── 7. Admin par défaut ──────────── */
+/* ═══════════════════════════════════════════════════════════
+   7. Admin par défaut
+   ═══════════════════════════════════════════════════════════ */
 
 async function ensureDefaultAdmin() {
   const { User } = getModels();
@@ -469,7 +619,9 @@ async function ensureDefaultAdmin() {
   return true;
 }
 
-/* ──────────── Entry point ──────────── */
+/* ═══════════════════════════════════════════════════════════
+   Entry point
+   ═══════════════════════════════════════════════════════════ */
 
 async function runStartupMigrations() {
   console.log(`[db-sync] mode "${MODE}"`);
@@ -482,38 +634,30 @@ async function runStartupMigrations() {
 
   if (MODE === "none") {
     console.log("[db-sync] aucune modification du schéma (mode none)");
-    // On saute tout, y compris la détection orphelines
   } else if (MODE === "alter") {
     console.warn("[db-sync] ⚠️  mode alter — Sequelize peut supprimer/réécrire");
     await sequelize.sync({ alter: true });
     console.log("[db-sync] schéma synchronisé (alter)");
   } else {
     const tables = await ensureTables();
-    const cols = await ensureColumns();
+    const colsResult = await ensureColumns();
     const enums = await ensureEnumColumns();
-
-    // Détection + traitement des tables orphelines
     const orphanResult = await handleOrphanTables();
-
-    // Détection anomalies
     const anomalies = await detectAnomalies();
 
-    if (
-      tables === 0 &&
-      cols === 0 &&
-      enums === 0 &&
-      orphanResult.detected === 0 &&
-      anomalies === 0
-    ) {
+    const parts = [];
+    if (tables) parts.push(`${tables} table(s) créée(s)`);
+    if (colsResult.added) parts.push(`${colsResult.added} colonne(s) ajoutée(s)`);
+    if (colsResult.fkAdded) parts.push(`${colsResult.fkAdded} FK ajoutée(s)`);
+    if (colsResult.fkSkipped) parts.push(`${colsResult.fkSkipped} FK ignorée(s)`);
+    if (enums) parts.push(`${enums} enum(s) étendu(s)`);
+    if (orphanResult.dropped) parts.push(`${orphanResult.dropped} table(s) supprimée(s)`);
+    if (orphanResult.warned) parts.push(`${orphanResult.warned} table(s) orpheline(s) ignorée(s)`);
+    if (anomalies) parts.push(`${anomalies} anomalie(s)`);
+
+    if (parts.length === 0) {
       console.log("[db-sync] [=] schéma à jour, aucune modification");
     } else {
-      const parts = [];
-      if (tables) parts.push(`${tables} table(s) créée(s)`);
-      if (cols) parts.push(`${cols} colonne(s) ajoutée(s)`);
-      if (enums) parts.push(`${enums} enum(s) étendu(s)`);
-      if (orphanResult.dropped) parts.push(`${orphanResult.dropped} table(s) supprimée(s)`);
-      if (orphanResult.warned) parts.push(`${orphanResult.warned} table(s) orpheline(s) ignorée(s)`);
-      if (anomalies) parts.push(`${anomalies} anomalie(s)`);
       console.log(`[db-sync] [✓] ${parts.join(", ")}`);
     }
 
@@ -524,7 +668,6 @@ async function runStartupMigrations() {
     }
   }
 
-  // Migration legacy + admin par défaut (toujours exécutés sauf mode none)
   if (MODE !== "none") {
     const migrateResult = await migrateLegacyAdmins();
     if (migrateResult.created > 0) {
@@ -534,7 +677,6 @@ async function runStartupMigrations() {
       );
       console.log("[db-migrate] ⚠️  Anciens tokens admin invalides — re-login requis.");
     }
-
     await ensureDefaultAdmin();
   }
 }
