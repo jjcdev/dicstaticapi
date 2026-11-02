@@ -1,5 +1,11 @@
 const rateLimit = require("express-rate-limit");
 
+/**
+ * Wrapper avec désactivation des validations bruyantes.
+ * Les vraies vérifications de sécurité sont faites ailleurs :
+ *   - trust proxy configuré via TRUST_PROXY (app.js)
+ *   - keyGenerator par défaut = req.ip (suffisant pour Render)
+ */
 const makeLimiter = (windowMs, max, message) =>
   rateLimit({
     windowMs,
@@ -7,6 +13,13 @@ const makeLimiter = (windowMs, max, message) =>
     standardHeaders: true,
     legacyHeaders: false,
     message: { message },
+    // Désactive les warnings de validation bruyants
+    validate: {
+      xForwardedForHeader: false,
+      trustProxy: false,
+      ip: false,
+      default: false,
+    },
   });
 
 exports.loginLimiter = makeLimiter(

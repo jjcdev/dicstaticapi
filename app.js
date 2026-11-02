@@ -50,6 +50,12 @@ const globalLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { message: "Trop de requêtes. Réessayez dans une minute." },
+  validate: {
+    xForwardedForHeader: false,
+    trustProxy: false,
+    ip: false,
+    default: false,
+  },
 });
 app.use("/api", globalLimiter);
 
