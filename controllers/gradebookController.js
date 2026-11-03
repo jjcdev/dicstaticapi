@@ -345,3 +345,57 @@ exports.deleteBonus = async (req, res, next) => {
     next(err);
   }
 };
+// controllers/gradebookController.js — ajouter
+exports.getMyGrades = async (req, res, next) => {
+  try {
+    const { Grade, Assessment, Workshop, WorkshopStudent, StudentBonus } = require("../models");
+    const { ENROLLMENT_STATUS } = require("../utils/constants");
+
+    const enrollments = await WorkshopStudent.findAll({
+      where: { student_id: req.user.id, status: ENROLLMENT_STATUS.ACTIVE },
+      include: [{ model: Workshop, as: "workshop", attributes: ["id", "title", "type"] }],
+    });
+
+    const result = [];
+    for (const enrollment of enrollments) {
+      const workshop = enrollment.workshop;
+      if (!workshop) continue;
+
+      const grades = await Grade.findAll({
+        where: { student_id: req.user.id },
+        include: [
+          {
+            model: Assessment,
+            as: "assessment",
+            where: { workshop_id: workshop.id },
+            required: true,
+            attributes: ["id", "name", "type", "max_value", "coefficient"],
+          },
+        ],
+      });
+
+      const bonuses = await StudentBonus.findAll({
+        where: { workshop_id: workshop.id, student_id: req.user.id },
+        attributes: ["id", "stars", "reason", "createdAt"],
+      });
+
+      result.push({
+        workshop,
+        grades: grades.map((g) => ({
+          assessment_id: g.assessment_id,
+          assessment_name: g.assessment.name,
+          assessment_type: g.assessment.type,
+          value: g.value,
+          max_value: g.assessment.max_value,
+          coefficient: g.assessment.coefficient,
+          comment: g.comment,
+        })),
+        bonuses,
+      });
+    }
+
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+};

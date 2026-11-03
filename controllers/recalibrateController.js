@@ -1,4 +1,3 @@
-const { Op } = require("sequelize");
 const {
   OrientationPreference,
   WorkshopTransferRequest,
@@ -20,18 +19,100 @@ const AppError = require("../utils/AppError");
 const isSuperuser = (user) =>
   [ROLES.ADMIN, ROLES.PRESIDENT].includes(user.role);
 
+/* ═══════════════════════════════════════════════════════════
+   Helpers partagés (preview ciblé + exécution ciblée)
+   ═══════════════════════════════════════════════════════════ */
+
 /**
- * Recalage en masse : prend toutes les OrientationPreference PENDING
- * (optionnellement filtrées), crée les WorkshopTransferRequest en mode
- * "forced", exécute les transferts et marque les preferences FULFILLED.
- *
- * Requête type :
- *   POST /api/recalibrate/bulk
- *   Body :
- *     { workshop_id?: "uuid",    // optionnel : uniquement les préférences vers ce pôle
- *       reason?: "string",       // texte ajouté en notification
- *       dry_run?: boolean }      // simule sans écrire
+ * Valide le body des endpoints /targeted et /targeted/preview.
+ * Retourne { student_ids, to_workshop_id } ou throw AppError(400).
  */
+function validateTargetedBody(body = {}) {
+  const { student_ids, to_workshop_id } = body || {};
+  if (
+    !Array.isArray(student_ids) ||
+    student_ids.length === 0 ||
+    typeof to_workshop_id !== "string"
+  ) {
+    throw new AppError(
+      "student_ids (tableau) et to_workshop_id requis.",
+      400
+    );
+  }
+  return { student_ids, to_workshop_id };
+}
+
+/**
+ * Charge et valide le pôle cible. Throw si introuvable ou non actif.
+ */
+async function loadTargetWorkshop(to_workshop_id) {
+  const target = await Workshop.findByPk(to_workshop_id);
+  if (!target) {
+    throw new AppError("Pôle cible introuvable.", 404);
+  }
+  if (target.status !== "active") {
+    throw new AppError("Ce pôle n'est pas actif.", 400);
+  }
+  return target;
+}
+
+/**
+ * Calcule la preview d'un recalage ciblé (aucune écriture DB).
+ * Retourne { preview, errors, processed, skipped, total_requested }.
+ *
+ * `preview[]` contient : student_id, student_name, from/to workshop
+ * avec les titres résolus (via include pour `from`).
+ *
+ * `errors[]` contient : { student_id, reason } pour chaque étudiant invalide.
+ */
+async function computeTargetedPreview(student_ids, to_workshop_id) {
+  const preview = [];
+  const errors = [];
+  let processed = 0;
+  let skipped = 0;
+
+  for (const studentId of student_ids) {
+    const student = await User.findByPk(studentId);
+    if (!student || student.role !== ROLES.STUDENT) {
+      errors.push({ student_id: studentId, reason: "Étudiant invalide." });
+      continue;
+    }
+
+    const enrollment = await WorkshopStudent.findOne({
+      where: {
+        student_id: student.id,
+        status: ENROLLMENT_STATUS.ACTIVE,
+      },
+      include: [{ model: Workshop, as: "workshop", attributes: ["id", "title"] }],
+    });
+
+    const fromWorkshopId = enrollment ? enrollment.workshop_id : null;
+
+    if (fromWorkshopId === to_workshop_id) {
+      // Déjà dans le pôle cible
+      skipped++;
+      continue;
+    }
+
+    processed++;
+    preview.push({
+      student_id: student.id,
+      student_name: `${student.first_name} ${student.last_name}`,
+      from_workshop_id: fromWorkshopId,
+      from_workshop_title: enrollment?.workshop?.title || null,
+      to_workshop_id,
+      to_workshop_title: null, // rempli par l'appelant qui a le target en main
+    });
+  }
+
+  return { preview, errors, processed, skipped, total_requested: student_ids.length };
+}
+
+/* ═══════════════════════════════════════════════════════════
+   POST /recalibrate/bulk
+   Recalage en masse basé sur les OrientationPreference PENDING.
+   ═══════════════════════════════════════════════════════════ */
+
 exports.bulkRecalibrate = async (req, res, next) => {
   try {
     if (!isSuperuser(req.user)) {
@@ -62,17 +143,16 @@ exports.bulkRecalibrate = async (req, res, next) => {
         processed: 0,
         skipped: 0,
         errors: [],
+        preview: [],
       });
     }
 
-    const results = {
-      processed: 0,
-      skipped: 0,
-      errors: [],
-    };
+    const results = { processed: 0, skipped: 0, errors: [] };
 
-    // Dry run : on calcule sans écrire
+    /* ─── Dry run : simulation + preview détaillée ─── */
     if (isDryRun) {
+      const preview = [];
+
       for (const pref of preferences) {
         const student = await User.findByPk(pref.student_id);
         if (!student) {
@@ -82,27 +162,44 @@ exports.bulkRecalibrate = async (req, res, next) => {
           });
           continue;
         }
+
         const enrollment = await WorkshopStudent.findOne({
           where: {
             student_id: pref.student_id,
             status: ENROLLMENT_STATUS.ACTIVE,
           },
+          include: [
+            { model: Workshop, as: "workshop", attributes: ["id", "title"] },
+          ],
         });
         const currentWorkshopId = enrollment ? enrollment.workshop_id : null;
+
         if (currentWorkshopId === pref.target_workshop_id) {
           results.skipped++;
           continue;
         }
+
         results.processed++;
+        preview.push({
+          preference_id: pref.id,
+          student_id: student.id,
+          student_name: `${student.first_name} ${student.last_name}`,
+          from_workshop_id: currentWorkshopId,
+          from_workshop_title: enrollment?.workshop?.title || null,
+          to_workshop_id: pref.target_workshop_id,
+          to_workshop_title: pref.target_workshop?.title || null,
+        });
       }
+
       return res.json({
         message: "Simulation terminée (dry_run).",
         ...results,
         total_preferences: preferences.length,
+        preview,
       });
     }
 
-    // Exécution réelle
+    /* ─── Exécution réelle ─── */
     const reasonText = reason
       ? sanitizeText(String(reason)).slice(0, 2000)
       : "Recalage administratif";
@@ -118,7 +215,6 @@ exports.bulkRecalibrate = async (req, res, next) => {
             throw new AppError("Étudiant introuvable.", 404);
           }
 
-          // Enrollment actuel
           const current = await WorkshopStudent.findOne({
             where: {
               student_id: student.id,
@@ -131,7 +227,6 @@ exports.bulkRecalibrate = async (req, res, next) => {
           const fromWorkshopId = current ? current.workshop_id : null;
 
           if (fromWorkshopId === pref.target_workshop_id) {
-            // Déjà dans le pôle cible : on marque "fulfilled" sans transfert
             await pref.update(
               {
                 status: ORIENTATION_STATUS.FULFILLED,
@@ -144,14 +239,12 @@ exports.bulkRecalibrate = async (req, res, next) => {
             return;
           }
 
-          // Sortir du pôle actuel
           if (current) {
             current.status = ENROLLMENT_STATUS.TRANSFERRED_OUT;
             current.dropped_at = new Date();
             await current.save({ transaction: t });
           }
 
-          // Entrer dans le pôle cible
           const year = await AcademicYear.findOne({
             where: { is_current: true },
             transaction: t,
@@ -183,7 +276,6 @@ exports.bulkRecalibrate = async (req, res, next) => {
             );
           }
 
-          // Créer un transfert approuvé pour la trace
           await WorkshopTransferRequest.create(
             {
               student_id: student.id,
@@ -197,7 +289,6 @@ exports.bulkRecalibrate = async (req, res, next) => {
             { transaction: t }
           );
 
-          // Marquer la préférence fulfilled
           await pref.update(
             {
               status: ORIENTATION_STATUS.FULFILLED,
@@ -210,7 +301,6 @@ exports.bulkRecalibrate = async (req, res, next) => {
           results.processed++;
         });
 
-        // Notification (hors transaction)
         push(pref.student_id, NOTIF_TYPES.ORIENTATION_FULFILLED, {
           orientation_id: pref.id,
           target_workshop_title: pref.target_workshop?.title || "Pôle",
@@ -235,12 +325,48 @@ exports.bulkRecalibrate = async (req, res, next) => {
   }
 };
 
-/**
- * Recalage ciblé : un ou plusieurs students vers un pôle.
- * Utile pour les cas individuels sans passer par une préférence.
- *
- * Body : { student_ids: [uuid], to_workshop_id: uuid, reason? }
- */
+/* ═══════════════════════════════════════════════════════════
+   POST /recalibrate/targeted/preview
+   Simulation du recalage ciblé (aucune écriture).
+   ═══════════════════════════════════════════════════════════ */
+
+exports.targetedRecalibratePreview = async (req, res, next) => {
+  try {
+    if (!isSuperuser(req.user)) {
+      return res.status(403).json({
+        message: "Réservé au président ou à l'administrateur.",
+      });
+    }
+
+    const { student_ids, to_workshop_id } = validateTargetedBody(req.body);
+    const target = await loadTargetWorkshop(to_workshop_id);
+
+    const { preview, errors, processed, skipped, total_requested } =
+      await computeTargetedPreview(student_ids, to_workshop_id);
+
+    // Remplir les to_workshop_title avec le vrai titre (tous identiques)
+    for (const p of preview) {
+      p.to_workshop_title = target.title;
+    }
+
+    res.json({
+      message: "Simulation terminée (targeted preview).",
+      would_process: processed,
+      would_skip: skipped,
+      total_requested,
+      errors,
+      preview,
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/* ═══════════════════════════════════════════════════════════
+   POST /recalibrate/targeted
+   Recalage ciblé : liste explicite d'étudiants → un pôle.
+   ═══════════════════════════════════════════════════════════ */
+
 exports.targetedRecalibrate = async (req, res, next) => {
   try {
     if (!isSuperuser(req.user)) {
@@ -250,23 +376,11 @@ exports.targetedRecalibrate = async (req, res, next) => {
     }
 
     const { student_ids, to_workshop_id, reason } = req.body || {};
-    if (
-      !Array.isArray(student_ids) ||
-      student_ids.length === 0 ||
-      typeof to_workshop_id !== "string"
-    ) {
-      return res.status(400).json({
-        message: "student_ids (tableau) et to_workshop_id requis.",
-      });
-    }
-
-    const target = await Workshop.findByPk(to_workshop_id);
-    if (!target) {
-      return res.status(404).json({ message: "Pôle cible introuvable." });
-    }
-    if (target.status !== "active") {
-      return res.status(400).json({ message: "Ce pôle n'est pas actif." });
-    }
+    const { student_ids: ids } = validateTargetedBody({
+      student_ids,
+      to_workshop_id,
+    });
+    const target = await loadTargetWorkshop(to_workshop_id);
 
     const reasonText = reason
       ? sanitizeText(String(reason)).slice(0, 2000)
@@ -274,7 +388,7 @@ exports.targetedRecalibrate = async (req, res, next) => {
 
     const results = { processed: 0, skipped: 0, errors: [] };
 
-    for (const studentId of student_ids) {
+    for (const studentId of ids) {
       try {
         await sequelize.transaction(async (t) => {
           const student = await User.findByPk(studentId, {
@@ -344,6 +458,22 @@ exports.targetedRecalibrate = async (req, res, next) => {
               force_reason: reasonText,
             },
             { transaction: t }
+          );
+
+          await OrientationPreference.update(
+            {
+              status: ORIENTATION_STATUS.FULFILLED,
+              decided_by: req.user.id,
+              decided_at: new Date(),
+            },
+            {
+              where: {
+                student_id: student.id,
+                target_workshop_id: to_workshop_id,
+                status: ORIENTATION_STATUS.PENDING,
+              },
+              transaction: t,
+            }
           );
 
           results.processed++;

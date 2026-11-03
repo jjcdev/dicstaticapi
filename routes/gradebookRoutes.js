@@ -3,6 +3,7 @@ const ctrl = require("../controllers/gradebookController");
 const { protect } = require("../middlewares/authMiddleware");
 const { authorize } = require("../middlewares/rbac");
 
+router.get("/me", protect, ctrl.getMyGrades);
 // Bordereau complet
 router.get(
   "/workshops/:workshopId",

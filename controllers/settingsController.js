@@ -6,15 +6,18 @@ const ALLOWED_KEYS = ["max_workshops_per_user"];
 
 /* ─────────── Lecture (admin) ─────────── */
 
+// controllers/settingsController.js
 exports.getAll = async (_req, res, next) => {
   try {
     const rows = await Settings.findAll();
     const result = {};
     rows.forEach((s) => {
-      result[s.key] = s.value;
+      // Convertir les valeurs numériques en number
+      const asInt = parseInt(s.value, 10);
+      result[s.key] = !isNaN(asInt) && String(asInt) === s.value ? asInt : s.value;
     });
     if (!result.max_workshops_per_user) {
-      result.max_workshops_per_user = String(DEFAULT_MAX_WORKSHOPS_PER_USER);
+      result.max_workshops_per_user = DEFAULT_MAX_WORKSHOPS_PER_USER;
     }
     res.json(result);
   } catch (err) {
