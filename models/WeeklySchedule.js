@@ -10,10 +10,7 @@ module.exports = (sequelize) =>
         defaultValue: DataTypes.UUIDV4,
         primaryKey: true,
       },
-      workshop_id: {
-        type: DataTypes.UUID,
-        allowNull: false,
-      },
+      workshop_id: { type: DataTypes.UUID, allowNull: false },
       week_start: {
         type: DataTypes.DATEONLY,
         allowNull: false,
@@ -23,22 +20,27 @@ module.exports = (sequelize) =>
         type: DataTypes.ENUM(
           SCHEDULE_STATUS.PROPOSED,
           SCHEDULE_STATUS.DRAFT,
-          SCHEDULE_STATUS.PUBLISHED
+          SCHEDULE_STATUS.PUBLISHED,
+          SCHEDULE_STATUS.REJECTED
         ),
         allowNull: false,
         defaultValue: SCHEDULE_STATUS.PROPOSED,
       },
-      created_by: {
-        type: DataTypes.UUID,
-        allowNull: false,
-      },
-      published_by: {
+      created_by: { type: DataTypes.UUID, allowNull: false },
+      published_by: { type: DataTypes.UUID, allowNull: true },
+      published_at: { type: DataTypes.DATE, allowNull: true },
+
+      // Nouveaux champs pour le rejet
+      rejected_by: {
         type: DataTypes.UUID,
         allowNull: true,
+        comment: "SG ou secrétaire adjoint qui a rejeté",
       },
-      published_at: {
-        type: DataTypes.DATE,
+      rejected_at: { type: DataTypes.DATE, allowNull: true },
+      rejection_reason: {
+        type: DataTypes.TEXT,
         allowNull: true,
+        comment: "Motif du rejet (obligatoire côté contrôleur)",
       },
     },
     {

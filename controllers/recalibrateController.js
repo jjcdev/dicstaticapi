@@ -11,22 +11,32 @@ const {
   ROLES,
   ORIENTATION_STATUS,
   ENROLLMENT_STATUS,
+  SUPERUSER_ROLES,
 } = require("../utils/constants");
 const { sanitizeText } = require("../utils/sanitize");
 const { push, NOTIF_TYPES } = require("../utils/notifications");
 const AppError = require("../utils/AppError");
+const { isWorkshopManager } = require("../middlewares/rbac");
 
-const isSuperuser = (user) =>
-  [ROLES.ADMIN, ROLES.PRESIDENT].includes(user.role);
-
-/* ═══════════════════════════════════════════════════════════
-   Helpers partagés (preview ciblé + exécution ciblée)
-   ═══════════════════════════════════════════════════════════ */
+const isSuperuser = (user) => SUPERUSER_ROLES.includes(user.role);
+const isCoordinator = (user) => user.role === ROLES.COORDINATEUR_GENERAL;
 
 /**
- * Valide le body des endpoints /targeted et /targeted/preview.
- * Retourne { student_ids, to_workshop_id } ou throw AppError(400).
+ * Peut recaler vers ce pôle :
+ *  - superuser (admin/president/VP)
+ *  - coordinateur général
+ *  - chef/adjoint du pôle cible
  */
+const canRecalibrate = (user, workshop) => {
+  if (isSuperuser(user) || isCoordinator(user)) return true;
+  if (!workshop) return false;
+  return isWorkshopManager(user, workshop);
+};
+
+/* ═══════════════════════════════════════════════════════════
+   Helpers
+   ═══════════════════════════════════════════════════════════ */
+
 function validateTargetedBody(body = {}) {
   const { student_ids, to_workshop_id } = body || {};
   if (
@@ -42,70 +52,100 @@ function validateTargetedBody(body = {}) {
   return { student_ids, to_workshop_id };
 }
 
-/**
- * Charge et valide le pôle cible. Throw si introuvable ou non actif.
- */
-async function loadTargetWorkshop(to_workshop_id) {
-  const target = await Workshop.findByPk(to_workshop_id);
-  if (!target) {
-    throw new AppError("Pôle cible introuvable.", 404);
-  }
-  if (target.status !== "active") {
-    throw new AppError("Ce pôle n'est pas actif.", 400);
-  }
+async function loadTargetWorkshop(id) {
+  const target = await Workshop.findByPk(id);
+  if (!target) throw new AppError("Pôle cible introuvable.", 404);
+  if (target.status !== "active") throw new AppError("Ce pôle n'est pas actif.", 400);
   return target;
 }
 
 /**
- * Calcule la preview d'un recalage ciblé (aucune écriture DB).
- * Retourne { preview, errors, processed, skipped, total_requested }.
- *
- * `preview[]` contient : student_id, student_name, from/to workshop
- * avec les titres résolus (via include pour `from`).
- *
- * `errors[]` contient : { student_id, reason } pour chaque étudiant invalide.
+ * Exécute un transfert "source → destination" dans une transaction.
+ * `hooks: false` sur les updates car l'ordre est contrôlé manuellement
+ * (source libérée AVANT destination activée). Le hook one-inscription
+ * n'a pas à interférer.
  */
-async function computeTargetedPreview(student_ids, to_workshop_id) {
-  const preview = [];
-  const errors = [];
-  let processed = 0;
-  let skipped = 0;
-
-  for (const studentId of student_ids) {
-    const student = await User.findByPk(studentId);
-    if (!student || student.role !== ROLES.STUDENT) {
-      errors.push({ student_id: studentId, reason: "Étudiant invalide." });
-      continue;
-    }
-
-    const enrollment = await WorkshopStudent.findOne({
+async function applyTransferInTransaction({
+  t,
+  student,
+  fromWorkshopId,
+  toWorkshopId,
+  forcedBy,
+  reason,
+}) {
+  // 1. Sortir de la source (si source)
+  if (fromWorkshopId) {
+    const current = await WorkshopStudent.findOne({
       where: {
+        workshop_id: fromWorkshopId,
         student_id: student.id,
         status: ENROLLMENT_STATUS.ACTIVE,
       },
-      include: [{ model: Workshop, as: "workshop", attributes: ["id", "title"] }],
+      transaction: t,
+      lock: t.LOCK.UPDATE,
     });
-
-    const fromWorkshopId = enrollment ? enrollment.workshop_id : null;
-
-    if (fromWorkshopId === to_workshop_id) {
-      // Déjà dans le pôle cible
-      skipped++;
-      continue;
+    if (current) {
+      await current.update(
+        {
+          status: ENROLLMENT_STATUS.TRANSFERRED_OUT,
+          dropped_at: new Date(),
+        },
+        { transaction: t, hooks: false }
+      );
     }
-
-    processed++;
-    preview.push({
-      student_id: student.id,
-      student_name: `${student.first_name} ${student.last_name}`,
-      from_workshop_id: fromWorkshopId,
-      from_workshop_title: enrollment?.workshop?.title || null,
-      to_workshop_id,
-      to_workshop_title: null, // rempli par l'appelant qui a le target en main
-    });
   }
 
-  return { preview, errors, processed, skipped, total_requested: student_ids.length };
+  // 2. Entrer dans la destination
+  const year = await AcademicYear.findOne({
+    where: { is_current: true },
+    transaction: t,
+  });
+
+  const dest = await WorkshopStudent.findOne({
+    where: { workshop_id: toWorkshopId, student_id: student.id },
+    transaction: t,
+    lock: t.LOCK.UPDATE,
+  });
+
+  if (dest) {
+    await dest.update(
+      {
+        status: ENROLLMENT_STATUS.ACTIVE,
+        joined_at: new Date(),
+        dropped_at: null,
+        rejected_at: null,
+        rejected_by: null,
+        rejection_reason: null,
+        academic_year_id: dest.academic_year_id || (year ? year.id : null),
+      },
+      { transaction: t, hooks: false }
+    );
+  } else {
+    await WorkshopStudent.create(
+      {
+        workshop_id: toWorkshopId,
+        student_id: student.id,
+        status: ENROLLMENT_STATUS.ACTIVE,
+        academic_year_id: year ? year.id : null,
+        joined_at: new Date(),
+      },
+      { transaction: t, hooks: false }
+    );
+  }
+
+  // 3. Créer un transfert approuvé pour la trace
+  return await WorkshopTransferRequest.create(
+    {
+      student_id: student.id,
+      from_workshop_id: fromWorkshopId || null,
+      to_workshop_id: toWorkshopId,
+      status: "approved",
+      forced_by: forcedBy,
+      forced_at: new Date(),
+      force_reason: reason,
+    },
+    { transaction: t }
+  );
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -115,12 +155,6 @@ async function computeTargetedPreview(student_ids, to_workshop_id) {
 
 exports.bulkRecalibrate = async (req, res, next) => {
   try {
-    if (!isSuperuser(req.user)) {
-      return res.status(403).json({
-        message: "Réservé au président ou à l'administrateur.",
-      });
-    }
-
     const { workshop_id, reason, dry_run } = req.body || {};
     const isDryRun = dry_run === true;
 
@@ -137,6 +171,19 @@ exports.bulkRecalibrate = async (req, res, next) => {
       ],
     });
 
+    // Chef : ne peut recaler que vers ses propres pôles
+    if (!isSuperuser(req.user) && !isCoordinator(req.user)) {
+      const targetIds = [...new Set(preferences.map((p) => p.target_workshop_id))];
+      for (const tid of targetIds) {
+        const w = await Workshop.findByPk(tid);
+        if (!canRecalibrate(req.user, w)) {
+          return res.status(403).json({
+            message: "Vous ne pouvez recaler que vers vos propres pôles.",
+          });
+        }
+      }
+    }
+
     if (preferences.length === 0) {
       return res.json({
         message: "Aucune préférence en attente à recaler.",
@@ -149,36 +196,24 @@ exports.bulkRecalibrate = async (req, res, next) => {
 
     const results = { processed: 0, skipped: 0, errors: [] };
 
-    /* ─── Dry run : simulation + preview détaillée ─── */
+    /* ─── Dry run : simulation + preview ─── */
     if (isDryRun) {
       const preview = [];
-
       for (const pref of preferences) {
         const student = await User.findByPk(pref.student_id);
         if (!student) {
-          results.errors.push({
-            preference_id: pref.id,
-            reason: "Étudiant introuvable",
-          });
+          results.errors.push({ preference_id: pref.id, reason: "Étudiant introuvable" });
           continue;
         }
-
         const enrollment = await WorkshopStudent.findOne({
-          where: {
-            student_id: pref.student_id,
-            status: ENROLLMENT_STATUS.ACTIVE,
-          },
-          include: [
-            { model: Workshop, as: "workshop", attributes: ["id", "title"] },
-          ],
+          where: { student_id: pref.student_id, status: ENROLLMENT_STATUS.ACTIVE },
+          include: [{ model: Workshop, as: "workshop", attributes: ["id", "title"] }],
         });
         const currentWorkshopId = enrollment ? enrollment.workshop_id : null;
-
         if (currentWorkshopId === pref.target_workshop_id) {
           results.skipped++;
           continue;
         }
-
         results.processed++;
         preview.push({
           preference_id: pref.id,
@@ -190,7 +225,6 @@ exports.bulkRecalibrate = async (req, res, next) => {
           to_workshop_title: pref.target_workshop?.title || null,
         });
       }
-
       return res.json({
         message: "Simulation terminée (dry_run).",
         ...results,
@@ -211,22 +245,17 @@ exports.bulkRecalibrate = async (req, res, next) => {
             transaction: t,
             lock: t.LOCK.UPDATE,
           });
-          if (!student) {
-            throw new AppError("Étudiant introuvable.", 404);
-          }
+          if (!student) throw new AppError("Étudiant introuvable.", 404);
 
           const current = await WorkshopStudent.findOne({
-            where: {
-              student_id: student.id,
-              status: ENROLLMENT_STATUS.ACTIVE,
-            },
+            where: { student_id: student.id, status: ENROLLMENT_STATUS.ACTIVE },
             transaction: t,
             lock: t.LOCK.UPDATE,
           });
-
           const fromWorkshopId = current ? current.workshop_id : null;
 
           if (fromWorkshopId === pref.target_workshop_id) {
+            // Déjà dans le pôle cible → juste marquer fulfilled
             await pref.update(
               {
                 status: ORIENTATION_STATUS.FULFILLED,
@@ -239,55 +268,14 @@ exports.bulkRecalibrate = async (req, res, next) => {
             return;
           }
 
-          if (current) {
-            current.status = ENROLLMENT_STATUS.TRANSFERRED_OUT;
-            current.dropped_at = new Date();
-            await current.save({ transaction: t });
-          }
-
-          const year = await AcademicYear.findOne({
-            where: { is_current: true },
-            transaction: t,
+          await applyTransferInTransaction({
+            t,
+            student,
+            fromWorkshopId,
+            toWorkshopId: pref.target_workshop_id,
+            forcedBy: req.user.id,
+            reason: reasonText,
           });
-          const dest = await WorkshopStudent.findOne({
-            where: {
-              workshop_id: pref.target_workshop_id,
-              student_id: student.id,
-            },
-            transaction: t,
-            lock: t.LOCK.UPDATE,
-          });
-          if (dest) {
-            dest.status = ENROLLMENT_STATUS.ACTIVE;
-            dest.joined_at = new Date();
-            dest.dropped_at = null;
-            if (!dest.academic_year_id && year) dest.academic_year_id = year.id;
-            await dest.save({ transaction: t });
-          } else {
-            await WorkshopStudent.create(
-              {
-                workshop_id: pref.target_workshop_id,
-                student_id: student.id,
-                status: ENROLLMENT_STATUS.ACTIVE,
-                academic_year_id: year ? year.id : null,
-                joined_at: new Date(),
-              },
-              { transaction: t }
-            );
-          }
-
-          await WorkshopTransferRequest.create(
-            {
-              student_id: student.id,
-              from_workshop_id: fromWorkshopId,
-              to_workshop_id: pref.target_workshop_id,
-              status: "approved",
-              forced_by: req.user.id,
-              forced_at: new Date(),
-              force_reason: reasonText,
-            },
-            { transaction: t }
-          );
 
           await pref.update(
             {
@@ -332,28 +320,55 @@ exports.bulkRecalibrate = async (req, res, next) => {
 
 exports.targetedRecalibratePreview = async (req, res, next) => {
   try {
-    if (!isSuperuser(req.user)) {
-      return res.status(403).json({
-        message: "Réservé au président ou à l'administrateur.",
-      });
-    }
-
     const { student_ids, to_workshop_id } = validateTargetedBody(req.body);
     const target = await loadTargetWorkshop(to_workshop_id);
 
-    const { preview, errors, processed, skipped, total_requested } =
-      await computeTargetedPreview(student_ids, to_workshop_id);
+    if (!canRecalibrate(req.user, target)) {
+      return res.status(403).json({
+        message: "Vous ne pouvez recaler que vers vos propres pôles.",
+      });
+    }
 
-    // Remplir les to_workshop_title avec le vrai titre (tous identiques)
-    for (const p of preview) {
-      p.to_workshop_title = target.title;
+    const preview = [];
+    const errors = [];
+    let processed = 0;
+    let skipped = 0;
+
+    for (const studentId of student_ids) {
+      const student = await User.findByPk(studentId);
+      if (!student || student.role !== ROLES.STUDENT) {
+        errors.push({ student_id: studentId, reason: "Étudiant invalide." });
+        continue;
+      }
+
+      const enrollment = await WorkshopStudent.findOne({
+        where: { student_id: student.id, status: ENROLLMENT_STATUS.ACTIVE },
+        include: [{ model: Workshop, as: "workshop", attributes: ["id", "title"] }],
+      });
+
+      const fromWorkshopId = enrollment ? enrollment.workshop_id : null;
+
+      if (fromWorkshopId === to_workshop_id) {
+        skipped++;
+        continue;
+      }
+
+      processed++;
+      preview.push({
+        student_id: student.id,
+        student_name: `${student.first_name} ${student.last_name}`,
+        from_workshop_id: fromWorkshopId,
+        from_workshop_title: enrollment?.workshop?.title || null,
+        to_workshop_id,
+        to_workshop_title: target.title,
+      });
     }
 
     res.json({
       message: "Simulation terminée (targeted preview).",
       would_process: processed,
       would_skip: skipped,
-      total_requested,
+      total_requested: student_ids.length,
       errors,
       preview,
     });
@@ -369,18 +384,18 @@ exports.targetedRecalibratePreview = async (req, res, next) => {
 
 exports.targetedRecalibrate = async (req, res, next) => {
   try {
-    if (!isSuperuser(req.user)) {
-      return res.status(403).json({
-        message: "Réservé au président ou à l'administrateur.",
-      });
-    }
-
     const { student_ids, to_workshop_id, reason } = req.body || {};
     const { student_ids: ids } = validateTargetedBody({
       student_ids,
       to_workshop_id,
     });
     const target = await loadTargetWorkshop(to_workshop_id);
+
+    if (!canRecalibrate(req.user, target)) {
+      return res.status(403).json({
+        message: "Vous ne pouvez recaler que vers vos propres pôles.",
+      });
+    }
 
     const reasonText = reason
       ? sanitizeText(String(reason)).slice(0, 2000)
@@ -400,10 +415,7 @@ exports.targetedRecalibrate = async (req, res, next) => {
           }
 
           const current = await WorkshopStudent.findOne({
-            where: {
-              student_id: student.id,
-              status: ENROLLMENT_STATUS.ACTIVE,
-            },
+            where: { student_id: student.id, status: ENROLLMENT_STATUS.ACTIVE },
             transaction: t,
             lock: t.LOCK.UPDATE,
           });
@@ -413,53 +425,16 @@ exports.targetedRecalibrate = async (req, res, next) => {
             return;
           }
 
-          if (current) {
-            current.status = ENROLLMENT_STATUS.TRANSFERRED_OUT;
-            current.dropped_at = new Date();
-            await current.save({ transaction: t });
-          }
-
-          const year = await AcademicYear.findOne({
-            where: { is_current: true },
-            transaction: t,
+          await applyTransferInTransaction({
+            t,
+            student,
+            fromWorkshopId: current ? current.workshop_id : null,
+            toWorkshopId: to_workshop_id,
+            forcedBy: req.user.id,
+            reason: reasonText,
           });
-          const dest = await WorkshopStudent.findOne({
-            where: { workshop_id: to_workshop_id, student_id: student.id },
-            transaction: t,
-            lock: t.LOCK.UPDATE,
-          });
-          if (dest) {
-            dest.status = ENROLLMENT_STATUS.ACTIVE;
-            dest.joined_at = new Date();
-            dest.dropped_at = null;
-            if (!dest.academic_year_id && year) dest.academic_year_id = year.id;
-            await dest.save({ transaction: t });
-          } else {
-            await WorkshopStudent.create(
-              {
-                workshop_id: to_workshop_id,
-                student_id: student.id,
-                status: ENROLLMENT_STATUS.ACTIVE,
-                academic_year_id: year ? year.id : null,
-                joined_at: new Date(),
-              },
-              { transaction: t }
-            );
-          }
 
-          await WorkshopTransferRequest.create(
-            {
-              student_id: student.id,
-              from_workshop_id: current ? current.workshop_id : null,
-              to_workshop_id,
-              status: "approved",
-              forced_by: req.user.id,
-              forced_at: new Date(),
-              force_reason: reasonText,
-            },
-            { transaction: t }
-          );
-
+          // Marquer les préférences pending vers ce pôle comme fulfilled
           await OrientationPreference.update(
             {
               status: ORIENTATION_STATUS.FULFILLED,

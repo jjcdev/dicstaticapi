@@ -1,11 +1,6 @@
 const {
-  Member,
-  GalleryPost,
-  Event,
-  ContactMessage,
-  Application,
-  RuleSection,
-  ProgramItem,
+  Member, GalleryPost, Event, ContactMessage,
+  Application, RuleSection, ProgramItem,
 } = require("../models");
 
 exports.stats = async (_req, res, next) => {
@@ -21,7 +16,5 @@ exports.stats = async (_req, res, next) => {
         ProgramItem.count(),
       ]);
     res.json({ members, photos, events, unread, applications, rules, program });
-  } catch (err) {
-    next(err);
-  }
+  } catch (err) { next(err); }
 };

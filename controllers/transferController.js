@@ -6,23 +6,22 @@ const {
   AcademicYear,
   sequelize,
 } = require("../models");
-const { ROLES, ENROLLMENT_STATUS } = require("../utils/constants");
+const {
+  ROLES,
+  ENROLLMENT_STATUS,
+  SUPERUSER_ROLES,
+} = require("../utils/constants");
 const { sanitizeText } = require("../utils/sanitize");
 const { ValidationError } = require("../utils/validators");
 const { NOTIF_TYPES, push } = require("../utils/notifications");
 const AppError = require("../utils/AppError");
+const {
+  isWorkshopManager,
+} = require("../middlewares/rbac");
 
 const TRANSFER_STATUS = WorkshopTransferRequest.STATUS;
 
-/* ─────────── Helpers ─────────── */
-
-const isSuperuser = (user) =>
-  user.role === ROLES.ADMIN || user.role === ROLES.PRESIDENT;
-
-const isWorkshopManager = (user, workshop) =>
-  workshop &&
-  (workshop.instructor_id === user.id ||
-    workshop.co_instructor_id === user.id);
+const isSuperuser = (user) => SUPERUSER_ROLES.includes(user.role);
 
 const includeFull = [
   { model: User, as: "student", attributes: ["id", "first_name", "last_name", "email"] },
@@ -32,24 +31,14 @@ const includeFull = [
 
 const validateDecisionBody = (body) => {
   const action = body.action;
-  if (!["accept", "reject"].includes(action)) {
-    throw new ValidationError({
-      action: "Action invalide (accept | reject).",
-    });
-  }
+  if (!["accept", "reject"].includes(action)) throw new ValidationError({ action: "Action invalide (accept | reject)." });
   const comment = body.comment ? sanitizeText(String(body.comment)) : null;
-  if (comment && comment.length > 2000) {
-    throw new ValidationError({ comment: "Commentaire trop long (max 2000)." });
-  }
+  if (comment && comment.length > 2000) throw new ValidationError({ comment: "Commentaire trop long (max 2000)." });
   return { action, comment };
 };
 
-/**
- * Exécute le transfert physique : A → out, B → active.
- * Doit être appelé dans une transaction.
- */
 async function executeTransfer(transfer, t) {
-  // Lock source enrollment
+  // 1. Sortir de la source (avant la destination, pour libérer l'unicité)
   const sourceEnrollment = await WorkshopStudent.findOne({
     where: {
       workshop_id: transfer.from_workshop_id,
@@ -60,23 +49,18 @@ async function executeTransfer(transfer, t) {
     lock: t.LOCK.UPDATE,
   });
   if (!sourceEnrollment) {
-    throw new AppError(
-      "L'étudiant n'est plus actif dans le pôle source.",
-      409
-    );
+    throw new AppError("L'étudiant n'est plus actif dans le pôle source.", 409);
   }
 
-  // Update source → transferred_out
-  sourceEnrollment.status = ENROLLMENT_STATUS.TRANSFERRED_OUT;
-  sourceEnrollment.dropped_at = new Date();
-  await sourceEnrollment.save({ transaction: t });
+  // Désactiver le hook pour ces updates contrôlés
+  await sourceEnrollment.update(
+    { status: ENROLLMENT_STATUS.TRANSFERRED_OUT, dropped_at: new Date() },
+    { transaction: t, hooks: false }
+  );
 
-  // Destination : reactivate or create
+  // 2. Entrer dans la destination
   const dest = await WorkshopStudent.findOne({
-    where: {
-      workshop_id: transfer.to_workshop_id,
-      student_id: transfer.student_id,
-    },
+    where: { workshop_id: transfer.to_workshop_id, student_id: transfer.student_id },
     transaction: t,
     lock: t.LOCK.UPDATE,
   });
@@ -87,11 +71,15 @@ async function executeTransfer(transfer, t) {
   });
 
   if (dest) {
-    dest.status = ENROLLMENT_STATUS.ACTIVE;
-    dest.joined_at = new Date();
-    dest.dropped_at = null;
-    if (!dest.academic_year_id && year) dest.academic_year_id = year.id;
-    await dest.save({ transaction: t });
+    await dest.update(
+      {
+        status: ENROLLMENT_STATUS.ACTIVE,
+        joined_at: new Date(),
+        dropped_at: null,
+        academic_year_id: dest.academic_year_id || (year ? year.id : null),
+      },
+      { transaction: t, hooks: false }  // ← hooks désactivés
+    );
   } else {
     await WorkshopStudent.create(
       {
@@ -101,72 +89,41 @@ async function executeTransfer(transfer, t) {
         academic_year_id: year ? year.id : null,
         joined_at: new Date(),
       },
-      { transaction: t }
+      { transaction: t, hooks: false }  // ← hooks désactivés
     );
   }
-
-  return { sourceEnrollment };
 }
 
-/* ─────────── Création d'une demande (étudiant) ─────────── */
+/* ─────────── Création (étudiant) ─────────── */
 
 exports.create = async (req, res, next) => {
   try {
     const to_workshop_id = req.body.to_workshop_id;
     if (!to_workshop_id || typeof to_workshop_id !== "string") {
-      return res
-        .status(400)
-        .json({ message: "Pôle cible requis (to_workshop_id)." });
+      return res.status(400).json({ message: "Pôle cible requis (to_workshop_id)." });
     }
+    const reason = req.body.reason ? sanitizeText(String(req.body.reason)).slice(0, 2000) : null;
 
-    const reason = req.body.reason
-      ? sanitizeText(String(req.body.reason)).slice(0, 2000)
-      : null;
-
-    // Son pôle actuel
     const currentEnrollment = await WorkshopStudent.findOne({
       where: { student_id: req.user.id, status: ENROLLMENT_STATUS.ACTIVE },
       include: [{ model: Workshop, as: "workshop" }],
     });
-    if (!currentEnrollment) {
-      return res.status(400).json({
-        message: "Vous n'êtes actuellement inscrit à aucun pôle.",
-      });
-    }
+    if (!currentEnrollment) return res.status(400).json({ message: "Vous n'êtes actuellement inscrit à aucun pôle." });
     const from_workshop_id = currentEnrollment.workshop_id;
-
-    if (from_workshop_id === to_workshop_id) {
-      return res.status(400).json({
-        message: "Vous ne pouvez pas demander un transfert vers votre pôle actuel.",
-      });
-    }
+    if (from_workshop_id === to_workshop_id) return res.status(400).json({ message: "Vous ne pouvez pas demander un transfert vers votre pôle actuel." });
 
     const toWorkshop = await Workshop.findByPk(to_workshop_id);
-    if (!toWorkshop) {
-      return res.status(404).json({ message: "Pôle cible introuvable." });
-    }
-    if (toWorkshop.status !== "active") {
-      return res.status(400).json({ message: "Ce pôle n'est pas actif." });
-    }
+    if (!toWorkshop) return res.status(404).json({ message: "Pôle cible introuvable." });
+    if (toWorkshop.status !== "active") return res.status(400).json({ message: "Ce pôle n'est pas actif." });
 
-    // Pas de transfert pending déjà
+    const { Op } = require("sequelize");
     const existingPending = await WorkshopTransferRequest.findOne({
       where: {
         student_id: req.user.id,
-        status: {
-          [require("sequelize").Op.in]: [
-            TRANSFER_STATUS.PENDING_SOURCE,
-            TRANSFER_STATUS.PENDING_DESTINATION,
-          ],
-        },
+        status: { [Op.in]: [TRANSFER_STATUS.PENDING_SOURCE, TRANSFER_STATUS.PENDING_DESTINATION] },
       },
     });
-    if (existingPending) {
-      return res.status(409).json({
-        message: "Vous avez déjà un transfert en cours.",
-        transfer_id: existingPending.id,
-      });
-    }
+    if (existingPending) return res.status(409).json({ message: "Vous avez déjà un transfert en cours.", transfer_id: existingPending.id });
 
     const transfer = await WorkshopTransferRequest.create({
       student_id: req.user.id,
@@ -176,12 +133,8 @@ exports.create = async (req, res, next) => {
       status: TRANSFER_STATUS.PENDING_SOURCE,
     });
 
-    // Notifier le chef du pôle source (et co-instructor)
     if (currentEnrollment.workshop) {
-      const managers = [
-        currentEnrollment.workshop.instructor_id,
-        currentEnrollment.workshop.co_instructor_id,
-      ].filter(Boolean);
+      const managers = [currentEnrollment.workshop.instructor_id, currentEnrollment.workshop.co_instructor_id].filter(Boolean);
       for (const mgrId of managers) {
         push(mgrId, NOTIF_TYPES.TRANSFER_REQUESTED, {
           transfer_id: transfer.id,
@@ -192,143 +145,84 @@ exports.create = async (req, res, next) => {
       }
     }
 
-    const full = await WorkshopTransferRequest.findByPk(transfer.id, {
-      include: includeFull,
-    });
+    const full = await WorkshopTransferRequest.findByPk(transfer.id, { include: includeFull });
     res.status(201).json(full);
-  } catch (err) {
-    next(err);
-  }
+  } catch (err) { next(err); }
 };
 
 /* ─────────── Liste ─────────── */
 
 exports.list = async (req, res, next) => {
   try {
+    const { Op } = require("sequelize");
     const where = {};
-
-    // Filtre status
-    if (
-      typeof req.query.status === "string" &&
-      Object.values(TRANSFER_STATUS).includes(req.query.status)
-    ) {
+    if (typeof req.query.status === "string" && Object.values(TRANSFER_STATUS).includes(req.query.status)) {
       where.status = req.query.status;
     }
-
-    // Filtre selon rôle
     if (req.user.role === ROLES.STUDENT) {
       where.student_id = req.user.id;
-    } else if (!isSuperuser(req.user) && req.user.role !== ROLES.SECRETAIRE_GENERALE) {
-      // Chef/adjoint : transferts sortants ou entrants de ses pôles
+    } else if (!isSuperuser(req.user) && ![ROLES.SECRETAIRE_GENERALE, ROLES.SECRETAIRE_ADJOINT, ROLES.COORDINATEUR_GENERAL].includes(req.user.role)) {
       const ownedWorkshops = await Workshop.findAll({
-        where: {
-          [require("sequelize").Op.or]: [
-            { instructor_id: req.user.id },
-            { co_instructor_id: req.user.id },
-          ],
-        },
+        where: { [Op.or]: [{ instructor_id: req.user.id }, { co_instructor_id: req.user.id }] },
         attributes: ["id"],
       });
       const ids = ownedWorkshops.map((w) => w.id);
-      where[require("sequelize").Op.or] = [
-        { from_workshop_id: { [require("sequelize").Op.in]: ids } },
-        { to_workshop_id: { [require("sequelize").Op.in]: ids } },
+      where[Op.or] = [
+        { from_workshop_id: { [Op.in]: ids } },
+        { to_workshop_id: { [Op.in]: ids } },
       ];
     }
-
     const transfers = await WorkshopTransferRequest.findAll({
-      where,
-      include: includeFull,
-      order: [["created_at", "DESC"]],
-      limit: 200,
+      where, include: includeFull, order: [["created_at", "DESC"]], limit: 200,
     });
     res.json(transfers);
-  } catch (err) {
-    next(err);
-  }
+  } catch (err) { next(err); }
 };
-
-/* ─────────── Détail ─────────── */
 
 exports.getOne = async (req, res, next) => {
   try {
-    const transfer = await WorkshopTransferRequest.findByPk(req.params.id, {
-      include: includeFull,
-    });
-    if (!transfer) {
-      return res.status(404).json({ message: "Transfert introuvable." });
-    }
+    const transfer = await WorkshopTransferRequest.findByPk(req.params.id, { include: includeFull });
+    if (!transfer) return res.status(404).json({ message: "Transfert introuvable." });
 
-    // Autorisations
-    const isStudent = transfer.student_id === req.user.id;
-    const isFromMgr = isWorkshopManager(req.user, transfer.from_workshop);
-    const isToMgr = isWorkshopManager(req.user, transfer.to_workshop);
     const canSee =
-      isStudent ||
-      isFromMgr ||
-      isToMgr ||
+      transfer.student_id === req.user.id ||
+      isWorkshopManager(req.user, transfer.from_workshop) ||
+      isWorkshopManager(req.user, transfer.to_workshop) ||
       isSuperuser(req.user) ||
-      req.user.role === ROLES.SECRETAIRE_GENERALE;
-
-    if (!canSee) {
-      return res.status(403).json({ message: "Accès refusé." });
-    }
+      [ROLES.SECRETAIRE_GENERALE, ROLES.SECRETAIRE_ADJOINT, ROLES.COORDINATEUR_GENERAL].includes(req.user.role);
+    if (!canSee) return res.status(403).json({ message: "Accès refusé." });
     res.json(transfer);
-  } catch (err) {
-    next(err);
-  }
+  } catch (err) { next(err); }
 };
-
-/* ─────────── Annulation par l'étudiant ─────────── */
 
 exports.cancel = async (req, res, next) => {
   try {
     const transfer = await WorkshopTransferRequest.findByPk(req.params.id);
-    if (!transfer) {
-      return res.status(404).json({ message: "Transfert introuvable." });
-    }
-    if (transfer.student_id !== req.user.id) {
-      return res.status(403).json({ message: "Vous n'êtes pas l'auteur de cette demande." });
-    }
-    if (
-      ![TRANSFER_STATUS.PENDING_SOURCE, TRANSFER_STATUS.PENDING_DESTINATION].includes(
-        transfer.status
-      )
-    ) {
-      return res.status(400).json({
-        message: "Cette demande ne peut plus être annulée.",
-      });
+    if (!transfer) return res.status(404).json({ message: "Transfert introuvable." });
+    if (transfer.student_id !== req.user.id) return res.status(403).json({ message: "Vous n'êtes pas l'auteur." });
+    if (![TRANSFER_STATUS.PENDING_SOURCE, TRANSFER_STATUS.PENDING_DESTINATION].includes(transfer.status)) {
+      return res.status(400).json({ message: "Cette demande ne peut plus être annulée." });
     }
     await transfer.update({ status: TRANSFER_STATUS.CANCELLED_BY_STUDENT });
     res.json({ message: "Demande annulée.", transfer });
-  } catch (err) {
-    next(err);
-  }
+  } catch (err) { next(err); }
 };
 
-/* ─────────── Décision du chef source ─────────── */
+/* ─────────── Décision SOURCE (chef/adjoint SEUL, PAS president/VP) ─────────── */
 
 exports.sourceDecision = async (req, res, next) => {
   try {
     const { action, comment } = validateDecisionBody(req.body);
-
-    const transfer = await WorkshopTransferRequest.findByPk(req.params.id, {
-      include: includeFull,
-    });
-    if (!transfer) {
-      return res.status(404).json({ message: "Transfert introuvable." });
-    }
+    const transfer = await WorkshopTransferRequest.findByPk(req.params.id, { include: includeFull });
+    if (!transfer) return res.status(404).json({ message: "Transfert introuvable." });
     if (transfer.status !== TRANSFER_STATUS.PENDING_SOURCE) {
-      return res.status(400).json({
-        message: `Statut actuel : ${transfer.status}. Décision source impossible.`,
-      });
+      return res.status(400).json({ message: `Statut actuel : ${transfer.status}. Décision source impossible.` });
     }
 
-    // Autorisation : chef/adjoint de la source OU superuser
-    if (!isSuperuser(req.user) && !isWorkshopManager(req.user, transfer.from_workshop)) {
-      return res.status(403).json({
-        message: "Seul le chef du pôle source peut décider.",
-      });
+    // Chef/adjoint owner du pôle source, ou admin
+    const canDecide = isAdmin(req.user) || isWorkshopManager(req.user, transfer.from_workshop);
+    if (!canDecide) {
+      return res.status(403).json({ message: "Seul le chef du pôle source peut décider." });
     }
 
     const now = new Date();
@@ -349,19 +243,14 @@ exports.sourceDecision = async (req, res, next) => {
       return res.json({ message: "Transfert rejeté.", transfer });
     }
 
-    // accept → pending_destination
     update.status = TRANSFER_STATUS.PENDING_DESTINATION;
     await transfer.update(update);
 
-    // Notifier étudiant + chef destination
     push(transfer.student_id, NOTIF_TYPES.TRANSFER_SOURCE_ACCEPTED, {
       transfer_id: transfer.id,
       to_workshop_title: transfer.to_workshop.title,
     });
-    const destManagers = [
-      transfer.to_workshop.instructor_id,
-      transfer.to_workshop.co_instructor_id,
-    ].filter(Boolean);
+    const destManagers = [transfer.to_workshop.instructor_id, transfer.to_workshop.co_instructor_id].filter(Boolean);
     for (const mgr of destManagers) {
       push(mgr, NOTIF_TYPES.TRANSFER_REQUESTED, {
         transfer_id: transfer.id,
@@ -373,34 +262,22 @@ exports.sourceDecision = async (req, res, next) => {
     }
 
     res.json({ message: "Transfert accepté côté source.", transfer });
-  } catch (err) {
-    next(err);
-  }
+  } catch (err) { next(err); }
 };
 
-/* ─────────── Décision du chef destination ─────────── */
+/* ─────────── Décision DESTINATION (chef/adjoint SEUL) ─────────── */
 
 exports.destinationDecision = async (req, res, next) => {
   try {
     const { action, comment } = validateDecisionBody(req.body);
-
-    const transfer = await WorkshopTransferRequest.findByPk(req.params.id, {
-      include: includeFull,
-    });
-    if (!transfer) {
-      return res.status(404).json({ message: "Transfert introuvable." });
-    }
+    const transfer = await WorkshopTransferRequest.findByPk(req.params.id, { include: includeFull });
+    if (!transfer) return res.status(404).json({ message: "Transfert introuvable." });
     if (transfer.status !== TRANSFER_STATUS.PENDING_DESTINATION) {
-      return res.status(400).json({
-        message: `Statut actuel : ${transfer.status}. Décision destination impossible.`,
-      });
+      return res.status(400).json({ message: `Statut actuel : ${transfer.status}. Décision destination impossible.` });
     }
 
-    if (!isSuperuser(req.user) && !isWorkshopManager(req.user, transfer.to_workshop)) {
-      return res.status(403).json({
-        message: "Seul le chef du pôle destination peut décider.",
-      });
-    }
+    const canDecide = isAdmin(req.user) || isWorkshopManager(req.user, transfer.to_workshop);
+    if (!canDecide) return res.status(403).json({ message: "Seul le chef du pôle destination peut décider." });
 
     const now = new Date();
 
@@ -419,18 +296,14 @@ exports.destinationDecision = async (req, res, next) => {
       return res.json({ message: "Transfert rejeté côté destination.", transfer });
     }
 
-    // accept → exécution atomique
     await sequelize.transaction(async (t) => {
       await executeTransfer(transfer, t);
-      await transfer.update(
-        {
-          status: TRANSFER_STATUS.APPROVED,
-          destination_decision_by: req.user.id,
-          destination_decision_at: now,
-          destination_decision_comment: comment,
-        },
-        { transaction: t }
-      );
+      await transfer.update({
+        status: TRANSFER_STATUS.APPROVED,
+        destination_decision_by: req.user.id,
+        destination_decision_at: now,
+        destination_decision_comment: comment,
+      }, { transaction: t });
     });
 
     push(transfer.student_id, NOTIF_TYPES.TRANSFER_DESTINATION_ACCEPTED, {
@@ -438,53 +311,35 @@ exports.destinationDecision = async (req, res, next) => {
       to_workshop_title: transfer.to_workshop.title,
     });
 
-    res.json({ message: "Transfert approuvé. Vous êtes maintenant dans le nouveau pôle.", transfer });
-  } catch (err) {
-    next(err);
-  }
+    res.json({ message: "Transfert approuvé.", transfer });
+  } catch (err) { next(err); }
 };
 
-/* ─────────── Force par admin/président ─────────── */
+/* ─────────── Force (admin/president/VP/coord) ─────────── */
+
+const isAdmin = (user) => user.role === ROLES.ADMIN;
 
 exports.force = async (req, res, next) => {
   try {
-    if (!isSuperuser(req.user)) {
-      return res.status(403).json({
-        message: "Réservé au président ou à l'administrateur.",
-      });
+    const canForce = isSuperuser(req.user) || req.user.role === ROLES.COORDINATEUR_GENERAL;
+    if (!canForce) return res.status(403).json({ message: "Réservé à la direction." });
+
+    const transfer = await WorkshopTransferRequest.findByPk(req.params.id, { include: includeFull });
+    if (!transfer) return res.status(404).json({ message: "Transfert introuvable." });
+    if (![TRANSFER_STATUS.PENDING_SOURCE, TRANSFER_STATUS.PENDING_DESTINATION].includes(transfer.status)) {
+      return res.status(400).json({ message: `Statut actuel : ${transfer.status}. Force impossible.` });
     }
 
-    const transfer = await WorkshopTransferRequest.findByPk(req.params.id, {
-      include: includeFull,
-    });
-    if (!transfer) {
-      return res.status(404).json({ message: "Transfert introuvable." });
-    }
-    if (
-      ![TRANSFER_STATUS.PENDING_SOURCE, TRANSFER_STATUS.PENDING_DESTINATION].includes(
-        transfer.status
-      )
-    ) {
-      return res.status(400).json({
-        message: `Statut actuel : ${transfer.status}. Force impossible.`,
-      });
-    }
-
-    const force_reason = req.body.force_reason
-      ? sanitizeText(String(req.body.force_reason)).slice(0, 2000)
-      : null;
+    const force_reason = req.body.force_reason ? sanitizeText(String(req.body.force_reason)).slice(0, 2000) : null;
 
     await sequelize.transaction(async (t) => {
       await executeTransfer(transfer, t);
-      await transfer.update(
-        {
-          status: TRANSFER_STATUS.APPROVED,
-          forced_by: req.user.id,
-          forced_at: new Date(),
-          force_reason,
-        },
-        { transaction: t }
-      );
+      await transfer.update({
+        status: TRANSFER_STATUS.APPROVED,
+        forced_by: req.user.id,
+        forced_at: new Date(),
+        force_reason,
+      }, { transaction: t });
     });
 
     push(transfer.student_id, NOTIF_TYPES.TRANSFER_FORCED, {
@@ -493,91 +348,53 @@ exports.force = async (req, res, next) => {
       force_reason,
     });
 
-    res.json({ message: "Transfert forcé et exécuté.", transfer });
-  } catch (err) {
-    next(err);
-  }
+    res.json({ message: "Transfert forcé.", transfer });
+  } catch (err) { next(err); }
 };
-
-/* ─────────── Force directe (recalage individuel) ─────────── */
-/* Crée + approuve en une seule opération. Pour les recalages administratifs. */
 
 exports.forceDirect = async (req, res, next) => {
   try {
-    if (!isSuperuser(req.user)) {
-      return res.status(403).json({
-        message: "Réservé au président ou à l'administrateur.",
-      });
-    }
+    const canForce = isSuperuser(req.user) || req.user.role === ROLES.COORDINATEUR_GENERAL;
+    if (!canForce) return res.status(403).json({ message: "Réservé à la direction." });
 
     const { student_id, to_workshop_id, reason } = req.body || {};
-    if (!student_id || !to_workshop_id) {
-      return res.status(400).json({
-        message: "student_id et to_workshop_id requis.",
-      });
-    }
+    if (!student_id || !to_workshop_id) return res.status(400).json({ message: "student_id et to_workshop_id requis." });
 
-    // Vérifier le student
     const student = await User.findByPk(student_id);
-    if (!student) {
-      return res.status(404).json({ message: "Étudiant introuvable." });
-    }
-    if (student.role !== ROLES.STUDENT) {
-      return res.status(400).json({
-        message: "Le recalage ne s'applique qu'aux étudiants.",
-      });
-    }
+    if (!student) return res.status(404).json({ message: "Étudiant introuvable." });
+    if (student.role !== ROLES.STUDENT) return res.status(400).json({ message: "Le recalage ne s'applique qu'aux étudiants." });
 
-    // Pôle cible
     const toWorkshop = await Workshop.findByPk(to_workshop_id);
-    if (!toWorkshop) {
-      return res.status(404).json({ message: "Pôle cible introuvable." });
-    }
-    if (toWorkshop.status !== "active") {
-      return res.status(400).json({ message: "Ce pôle n'est pas actif." });
-    }
+    if (!toWorkshop) return res.status(404).json({ message: "Pôle cible introuvable." });
+    if (toWorkshop.status !== "active") return res.status(400).json({ message: "Ce pôle n'est pas actif." });
 
-    // Pôle actuel (peut ne pas exister)
     const currentEnrollment = await WorkshopStudent.findOne({
       where: { student_id, status: ENROLLMENT_STATUS.ACTIVE },
     });
-
     if (currentEnrollment && currentEnrollment.workshop_id === to_workshop_id) {
-      return res.status(400).json({
-        message: "L'étudiant est déjà actif dans ce pôle.",
-      });
+      return res.status(400).json({ message: "L'étudiant est déjà actif dans ce pôle." });
     }
 
     const force_reason = reason ? sanitizeText(String(reason)).slice(0, 2000) : null;
 
     const result = await sequelize.transaction(async (t) => {
-      // Créer la demande "fantôme" déjà approuvée
-      const transfer = await WorkshopTransferRequest.create(
-        {
-          student_id,
-          from_workshop_id: currentEnrollment ? currentEnrollment.workshop_id : null,
-          to_workshop_id,
-          status: TRANSFER_STATUS.APPROVED,
-          forced_by: req.user.id,
-          forced_at: new Date(),
-          force_reason,
-        },
-        { transaction: t }
-      );
+      const transfer = await WorkshopTransferRequest.create({
+        student_id,
+        from_workshop_id: currentEnrollment ? currentEnrollment.workshop_id : null,
+        to_workshop_id,
+        status: TRANSFER_STATUS.APPROVED,
+        forced_by: req.user.id,
+        forced_at: new Date(),
+        force_reason,
+      }, { transaction: t });
 
-      // Exécuter si enrollment source existe
       if (currentEnrollment) {
         await executeTransfer(transfer, t);
       } else {
-        // Pas de source → créer juste l'enrollment destination
-        const year = await AcademicYear.findOne({
-          where: { is_current: true },
-          transaction: t,
-        });
+        const year = await AcademicYear.findOne({ where: { is_current: true }, transaction: t });
         const existing = await WorkshopStudent.findOne({
           where: { workshop_id: to_workshop_id, student_id },
-          transaction: t,
-          lock: t.LOCK.UPDATE,
+          transaction: t, lock: t.LOCK.UPDATE,
         });
         if (existing) {
           existing.status = ENROLLMENT_STATUS.ACTIVE;
@@ -586,19 +403,15 @@ exports.forceDirect = async (req, res, next) => {
           if (!existing.academic_year_id && year) existing.academic_year_id = year.id;
           await existing.save({ transaction: t });
         } else {
-          await WorkshopStudent.create(
-            {
-              workshop_id: to_workshop_id,
-              student_id,
-              status: ENROLLMENT_STATUS.ACTIVE,
-              academic_year_id: year ? year.id : null,
-              joined_at: new Date(),
-            },
-            { transaction: t }
-          );
+          await WorkshopStudent.create({
+            workshop_id: to_workshop_id,
+            student_id,
+            status: ENROLLMENT_STATUS.ACTIVE,
+            academic_year_id: year ? year.id : null,
+            joined_at: new Date(),
+          }, { transaction: t });
         }
       }
-
       return transfer;
     });
 
@@ -608,11 +421,7 @@ exports.forceDirect = async (req, res, next) => {
       force_reason,
     });
 
-    const full = await WorkshopTransferRequest.findByPk(result.id, {
-      include: includeFull,
-    });
+    const full = await WorkshopTransferRequest.findByPk(result.id, { include: includeFull });
     res.status(201).json(full);
-  } catch (err) {
-    next(err);
-  }
+  } catch (err) { next(err); }
 };

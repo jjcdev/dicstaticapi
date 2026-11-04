@@ -1,6 +1,6 @@
 const { DataTypes } = require("sequelize");
 const bcrypt = require("bcryptjs");
-const { ROLES } = require("../utils/constants");
+const { ROLES, SEXE } = require("../utils/constants");
 
 module.exports = (sequelize) => {
   const User = sequelize.define(
@@ -27,6 +27,11 @@ module.exports = (sequelize) => {
           len: { args: [2, 100], msg: "Nom : 2 à 100 caractères." },
         },
       },
+      sexe: {
+        type: DataTypes.ENUM(SEXE.HOMME, SEXE.FEMME),
+        allowNull: true,
+        comment: "nullable — utilisé pour le genrage des rôles côté frontend",
+      },
       email: {
         type: DataTypes.STRING(160),
         allowNull: false,
@@ -42,14 +47,7 @@ module.exports = (sequelize) => {
         allowNull: false,
       },
       role: {
-        type: DataTypes.ENUM(
-          ROLES.ADMIN,
-          ROLES.PRESIDENT,
-          ROLES.SECRETAIRE_GENERALE,
-          ROLES.INSTRUCTOR,
-          ROLES.CO_INSTRUCTOR,
-          ROLES.STUDENT
-        ),
+        type: DataTypes.ENUM(...Object.values(ROLES)),
         allowNull: false,
         defaultValue: ROLES.STUDENT,
       },
@@ -58,39 +56,14 @@ module.exports = (sequelize) => {
         allowNull: false,
         defaultValue: true,
       },
-      profile_picture: {
-        type: DataTypes.STRING(255),
-        allowNull: true,
-      },
-      bio: {
-        type: DataTypes.TEXT,
-        allowNull: true,
-      },
-      department: {
-        type: DataTypes.STRING(100),
-        allowNull: true,
-      },
-      level: {
-        type: DataTypes.STRING(50),
-        allowNull: true,
-      },
-      reset_password_token: {
-        type: DataTypes.STRING(255),
-        allowNull: true,
-      },
-      reset_password_expire: {
-        type: DataTypes.DATE,
-        allowNull: true,
-      },
-      last_login: {
-        type: DataTypes.DATE,
-        allowNull: true,
-      },
-      legacy_admin_id: {
-        type: DataTypes.INTEGER,
-        allowNull: true,
-        unique: true,
-      },
+      profile_picture: { type: DataTypes.STRING(255), allowNull: true },
+      bio: { type: DataTypes.TEXT, allowNull: true },
+      department: { type: DataTypes.STRING(100), allowNull: true },
+      level: { type: DataTypes.STRING(50), allowNull: true },
+      reset_password_token: { type: DataTypes.STRING(255), allowNull: true },
+      reset_password_expire: { type: DataTypes.DATE, allowNull: true },
+      last_login: { type: DataTypes.DATE, allowNull: true },
+      legacy_admin_id: { type: DataTypes.INTEGER, allowNull: true, unique: true },
     },
     {
       tableName: "users",
