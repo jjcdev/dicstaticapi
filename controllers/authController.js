@@ -12,12 +12,12 @@ const signToken = (id) =>
     expiresIn: process.env.JWT_EXPIRES_IN || "7d",
   });
 
-const safeUser = (user) => user.toSafeJSON();
-
 /**
- * Alias de compatibilité : certains fronts vitrine lisent `.admin`.
- * On renvoie `admin` si l'utilisateur a le rôle admin, sinon absent.
+ * Sérialisation "self" — inclut les champs QR + `qr_needs_refresh`.
+ * Utilisé par login, me, updateProfile.
  */
+const safeUser = (user) => user.toSelfJSON();
+
 const withAdminAlias = (user) => {
   const payload = { user: safeUser(user) };
   if (user.role === ROLES.ADMIN) {
@@ -31,7 +31,7 @@ const withAdminAlias = (user) => {
   return payload;
 };
 
-/* ─────────────── Register ─────────────── */
+/* ─────────── Register ─────────── */
 
 exports.register = async (req, res, next) => {
   try {
@@ -40,6 +40,9 @@ exports.register = async (req, res, next) => {
     const email = normalizeEmail(req.body.email);
     const password = req.body.password;
     const phone = req.body.phone ? String(req.body.phone).trim() : null;
+    const sexe = req.body.sexe === "homme" || req.body.sexe === "femme"
+      ? req.body.sexe
+      : null;
 
     const errors = {};
     if (!first_name || first_name.length < 2) {
@@ -55,16 +58,12 @@ exports.register = async (req, res, next) => {
       errors.password = "Mot de passe requis (8 caractères min).";
     }
     if (Object.keys(errors).length) {
-      return res
-        .status(400)
-        .json({ message: "Validation échouée.", errors });
+      return res.status(400).json({ message: "Validation échouée.", errors });
     }
 
     const existing = await User.findOne({ where: { email } });
     if (existing) {
-      return res
-        .status(409)
-        .json({ message: "Cet email est déjà utilisé." });
+      return res.status(409).json({ message: "Cet email est déjà utilisé." });
     }
 
     const user = await User.create({
@@ -72,6 +71,7 @@ exports.register = async (req, res, next) => {
       last_name,
       email,
       phone,
+      sexe,
       password,
       role: ROLES.STUDENT,
     });
@@ -85,7 +85,7 @@ exports.register = async (req, res, next) => {
   }
 };
 
-/* ─────────────── Login ─────────────── */
+/* ─────────── Login ─────────── */
 
 exports.login = async (req, res, next) => {
   try {
@@ -93,15 +93,11 @@ exports.login = async (req, res, next) => {
     const password = req.body.password;
 
     if (!email || !password) {
-      return res
-        .status(400)
-        .json({ message: "Email et mot de passe requis." });
+      return res.status(400).json({ message: "Email et mot de passe requis." });
     }
 
     const user = await User.findOne({ where: { email } });
-    if (!user) {
-      return res.status(401).json({ message: "Identifiants invalides." });
-    }
+    if (!user) return res.status(401).json({ message: "Identifiants invalides." });
 
     if (!user.is_active) {
       return res.status(401).json({
@@ -110,9 +106,7 @@ exports.login = async (req, res, next) => {
     }
 
     const ok = await user.comparePassword(password);
-    if (!ok) {
-      return res.status(401).json({ message: "Identifiants invalides." });
-    }
+    if (!ok) return res.status(401).json({ message: "Identifiants invalides." });
 
     await user.update({ last_login: new Date() });
 
@@ -125,24 +119,17 @@ exports.login = async (req, res, next) => {
   }
 };
 
-/* ─────────────── Me ─────────────── */
+/* ─────────── Me ─────────── */
 
 exports.me = async (req, res) => {
   res.json(withAdminAlias(req.user));
 };
 
-/* ─────────────── Update profile ─────────────── */
+/* ─────────── Update profile ─────────── */
 
 exports.updateProfile = async (req, res, next) => {
   try {
-    const allowed = [
-      "first_name",
-      "last_name",
-      "phone",
-      "bio",
-      "department",
-      "level",
-    ];
+    const allowed = ["first_name", "last_name", "phone", "bio", "department", "level"];
     const updates = {};
     for (const k of allowed) {
       if (req.body[k] !== undefined) updates[k] = req.body[k];
@@ -158,15 +145,13 @@ exports.updateProfile = async (req, res, next) => {
   }
 };
 
-/* ─────────────── Change password ─────────────── */
+/* ─────────── Change password ─────────── */
 
 exports.changePassword = async (req, res, next) => {
   try {
     const { current_password, new_password } = req.body;
     if (!current_password || !new_password) {
-      return res
-        .status(400)
-        .json({ message: "Ancien et nouveau mot de passe requis." });
+      return res.status(400).json({ message: "Ancien et nouveau mot de passe requis." });
     }
     if (new_password.length < 8) {
       return res.status(400).json({
@@ -178,11 +163,7 @@ exports.changePassword = async (req, res, next) => {
     if (!user) return res.status(404).json({ message: "Compte introuvable." });
 
     const ok = await user.comparePassword(current_password);
-    if (!ok) {
-      return res
-        .status(401)
-        .json({ message: "Mot de passe actuel incorrect." });
-    }
+    if (!ok) return res.status(401).json({ message: "Mot de passe actuel incorrect." });
 
     await user.update({ password: new_password });
     res.json({ message: "Mot de passe modifié." });
@@ -191,7 +172,7 @@ exports.changePassword = async (req, res, next) => {
   }
 };
 
-/* ─────────────── Check role change ─────────────── */
+/* ─────────── Check role change ─────────── */
 
 exports.checkRoleChange = async (req, res, next) => {
   try {

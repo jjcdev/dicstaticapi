@@ -9,31 +9,30 @@ module.exports = (sequelize) =>
         defaultValue: DataTypes.UUIDV4,
         primaryKey: true,
       },
-      workshop_id: {
-        type: DataTypes.UUID,
-        allowNull: false,
-      },
-      student_id: {
-        type: DataTypes.UUID,
-        allowNull: false,
-      },
+      workshop_id: { type: DataTypes.UUID, allowNull: false },
+      student_id: { type: DataTypes.UUID, allowNull: false },
       stars: {
         type: DataTypes.INTEGER,
-        allowNull: false,
-        defaultValue: 1,
+        allowNull: true,
+        defaultValue: null,
         validate: {
           min: { args: [1], msg: "Minimum 1 étoile." },
           max: { args: [5], msg: "Maximum 5 étoiles." },
         },
+        comment: "Visuel optionnel (1-5). Peut être null si le respo ne veut que des points.",
       },
-      reason: {
-        type: DataTypes.STRING(255),
+      points: {
+        type: DataTypes.FLOAT,
         allowNull: true,
+        defaultValue: 0,
+        validate: {
+          min: { args: [0], msg: "Points : min 0." },
+          max: { args: [20], msg: "Points : max 20." },
+        },
+        comment: "Points ajoutés à la moyenne. Le respo choisit librement.",
       },
-      awarded_by: {
-        type: DataTypes.UUID,
-        allowNull: true,
-      },
+      reason: { type: DataTypes.STRING(255), allowNull: true },
+      awarded_by: { type: DataTypes.UUID, allowNull: true },
     },
     {
       tableName: "student_bonuses",

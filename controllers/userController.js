@@ -1,4 +1,4 @@
-const { User, Workshop } = require("../models");
+const { User } = require("../models");
 const { ROLES, ALL_ROLES, SUPERUSER_ROLES, SEXE } = require("../utils/constants");
 const { notifyRoleChange } = require("../utils/roleChangeNotifier");
 const { sanitizeLine } = require("../utils/sanitize");
@@ -30,23 +30,34 @@ exports.getAll = async (req, res, next) => {
 
     const users = await User.findAll({
       where,
-      attributes: { exclude: ["password", "reset_password_token", "reset_password_expire", "legacy_admin_id"] },
+      attributes: {
+        exclude: [
+          "password", "reset_password_token", "reset_password_expire",
+          "legacy_admin_id",
+          "qr_token", "qr_generated_at", "qr_reset_at", // QR jamais exposé en liste
+        ],
+      },
       order: [["created_at", "DESC"]],
       limit: 200,
     });
     res.json(users);
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 };
 
 exports.getOne = async (req, res, next) => {
   try {
-    if (!isSuperuser(req.user) && req.user.id !== req.params.id) {
+    const isSelf = req.user.id === req.params.id;
+    if (!isSuperuser(req.user) && !isSelf) {
       return res.status(403).json({ message: "Accès refusé." });
     }
     const user = await User.findByPk(req.params.id);
     if (!user) return res.status(404).json({ message: "Utilisateur introuvable." });
-    res.json(user.toSafeJSON());
-  } catch (err) { next(err); }
+    res.json(isSelf ? user.toSelfJSON() : user.toSafeJSON());
+  } catch (err) {
+    next(err);
+  }
 };
 
 /* ─────────── Changement rôle (ADMIN SEUL) ─────────── */
@@ -56,7 +67,6 @@ exports.updateRole = async (req, res, next) => {
     if (req.user.role !== ROLES.ADMIN) {
       return res.status(403).json({ message: "Seul l'administrateur peut changer les rôles." });
     }
-
     const { role } = req.body;
     if (!ALL_ROLES.includes(role)) return res.status(400).json({ message: "Rôle invalide." });
 
@@ -75,7 +85,9 @@ exports.updateRole = async (req, res, next) => {
     await user.update({ role, is_active: true });
     if (oldRole !== role) notifyRoleChange(user.id, role, oldRole);
     res.json(user.toSafeJSON());
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 };
 
 exports.deactivate = async (req, res, next) => {
@@ -90,7 +102,9 @@ exports.deactivate = async (req, res, next) => {
     }
     await user.update({ is_active: false });
     res.json({ message: "Utilisateur désactivé." });
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 };
 
 exports.reactivate = async (req, res, next) => {
@@ -100,10 +114,12 @@ exports.reactivate = async (req, res, next) => {
     if (!user) return res.status(404).json({ message: "Utilisateur introuvable." });
     await user.update({ is_active: true });
     res.json(user.toSafeJSON());
-  } catch (err) { next(err); }
+  } catch (err) {
+    next(err);
+  }
 };
 
-/* ─────────── Mise à jour profil self (ajout sexe) ─────────── */
+/* ─────────── Mise à jour profil self (avec sexe) ─────────── */
 
 exports.updateSelf = async (req, res, next) => {
   try {
@@ -121,6 +137,8 @@ exports.updateSelf = async (req, res, next) => {
 
     const user = await User.findByPk(req.user.id);
     await user.update(updates);
-    res.json({ user: user.toSafeJSON() });
-  } catch (err) { next(err); }
+    res.json({ user: user.toSelfJSON() });
+  } catch (err) {
+    next(err);
+  }
 };

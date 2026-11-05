@@ -1,10 +1,13 @@
 const router = require("express").Router();
 const ctrl = require("../controllers/userController");
-const { protect, protectAdmin } = require("../middlewares/authMiddleware");
+const qrCtrl = require("../controllers/qrController");
+const { protect } = require("../middlewares/authMiddleware");
 const { authorize } = require("../middlewares/rbac");
 
-/* ─── Self (profil) ─── */
+/* ─── Self (profil + QR) ─── */
 router.patch("/me", protect, ctrl.updateSelf);
+router.get("/me/qr", protect, qrCtrl.getMyQr);
+router.post("/me/qr/regenerate", protect, qrCtrl.regenerateMyQr);
 
 /* ─── Lecture (admin + president + VP) ─── */
 router.get("/", protect, authorize("user:read_all"), ctrl.getAll);

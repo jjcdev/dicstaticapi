@@ -87,3 +87,8 @@ exports.programPublicLimiter = makeLimiter(
   120,
   "Trop de requêtes. Réessayez dans une minute."
 );
+exports.scanLimiter = makeLimiter(
+  60 * 1000,
+  100,
+  "Trop de scans. Réessayez dans une minute."
+);

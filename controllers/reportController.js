@@ -13,21 +13,13 @@ const {
   validateAttendeeEntry,
 } = require("../utils/validators");
 const AppError = require("../utils/AppError");
+const { isWorkshopManager } = require("../middlewares/rbac");
 
 const EDIT_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 const isSuperuser = (user) =>
-  [ROLES.ADMIN, ROLES.PRESIDENT].includes(user.role);
+  [ROLES.ADMIN, ROLES.PRESIDENT, ROLES.VICE_PRESIDENT].includes(user.role);
 
-const isWorkshopManager = (user, workshop) => {
-  if (!workshop) return false;
-  return (
-    workshop.instructor_id === user.id ||
-    workshop.co_instructor_id === user.id
-  );
-};
-
-// Attributs complets du workshop pour permettre le contrôle d'accès
 const WORKSHOP_ATTRS = [
   "id",
   "title",
@@ -56,10 +48,8 @@ const includeFullAttendees = [
   },
 ];
 
-/**
- * Retourne la Date limite d'édition, ou null si non calculable.
- * Base : client_created_at (offline) ou createdAt (online).
- */
+/* ─────────── Helpers de calcul de fenêtre d'édition ─────────── */
+
 const computeEditableUntil = (report) => {
   const base = report.client_created_at || report.createdAt;
   if (!base) return null;
@@ -70,7 +60,7 @@ const computeEditableUntil = (report) => {
 
 const isEditable = (report) => {
   const until = computeEditableUntil(report);
-  if (!until) return true; // fail-open : si pas de base, on autorise
+  if (!until) return true;
   return new Date() <= until;
 };
 
@@ -78,6 +68,8 @@ const getEditableUntilISO = (report) => {
   const d = computeEditableUntil(report);
   return d ? d.toISOString() : null;
 };
+
+/* ─────────── Helpers de création ─────────── */
 
 const getActiveStudents = async (workshopId) => {
   const enrollments = await WorkshopStudent.findAll({
@@ -316,7 +308,7 @@ exports.remove = async (req, res, next) => {
   }
 };
 
-/* ─────────── Mise à jour attendees ─────────── */
+/* ─────────── Mise à jour attendees (bulk manuel) ─────────── */
 
 exports.updateAttendees = async (req, res, next) => {
   try {
@@ -551,6 +543,169 @@ exports.myAttendances = async (req, res, next) => {
         absent: total - present,
         rate: total > 0 ? Math.round((present / total) * 100) : 0,
       },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/* ═══════════════════════════════════════════════════════════
+   ─── NOUVEAU : Scan QR code ───
+   ═══════════════════════════════════════════════════════════ */
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Valide la précondition commune aux 2 routes de scan :
+ *  - rapport existe
+ *  - user est chef/adjoint owner du pôle du rapport
+ *  - (pour scanMark) fenêtre 24h respectée
+ */
+async function loadReportForScan(req) {
+  const report = await SessionReport.findByPk(req.params.id, {
+    include: [
+      { model: Workshop, as: "workshop", attributes: WORKSHOP_ATTRS },
+    ],
+  });
+  if (!report) throw new AppError("Rapport introuvable.", 404);
+
+  if (!isSuperuser(req.user) && !isWorkshopManager(req.user, report.workshop)) {
+    throw new AppError("Vous n'êtes pas responsable de cet atelier.", 403);
+  }
+
+  return report;
+}
+
+/**
+ * Résout le qrToken → User → SessionReportAttendee.
+ * Retourne { student, attendee } ou throw AppError.
+ */
+async function resolveQrToAttendee(report, qrToken) {
+  if (typeof qrToken !== "string" || !UUID_RE.test(qrToken)) {
+    throw new AppError("Format de QR code invalide.", 400);
+  }
+
+  // Lookup par qr_token (index UNIQUE → rapide)
+  const student = await User.findOne({
+    where: { qr_token: qrToken, is_active: true },
+    attributes: ["id", "first_name", "last_name", "email"],
+  });
+  if (!student) {
+    throw new AppError(
+      "QR code inconnu. Il a peut-être été régénéré.",
+      404
+    );
+  }
+
+  const attendee = await SessionReportAttendee.findOne({
+    where: { report_id: report.id, student_id: student.id },
+  });
+  if (!attendee) {
+    throw new AppError(
+      "Cet étudiant n'est pas attendu à cette séance.",
+      404
+    );
+  }
+
+  return { student, attendee };
+}
+
+/**
+ * GET /reports/:id/scan/lookup/:qrToken
+ * Preview : qui est cet étudiant ? quel est son statut actuel ?
+ * Aucune modification.
+ */
+exports.scanLookup = async (req, res, next) => {
+  try {
+    const report = await loadReportForScan(req);
+    const { student, attendee } = await resolveQrToAttendee(
+      report,
+      req.params.qrToken
+    );
+
+    res.json({
+      student: {
+        id: student.id,
+        first_name: student.first_name,
+        last_name: student.last_name,
+        email: student.email,
+      },
+      current_status: attendee.status,
+      is_in_report: true,
+      already_present: attendee.status === "present",
+      editable: isEditable(report),
+      editable_until: getEditableUntilISO(report),
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * POST /reports/:id/scan
+ * Marque l'étudiant comme présent. Idempotent si déjà présent.
+ */
+exports.scanMark = async (req, res, next) => {
+  try {
+    const report = await loadReportForScan(req);
+
+    if (!isEditable(report)) {
+      return res.status(403).json({
+        message: "Fenêtre d'édition expirée (24h après création).",
+        editable_until: getEditableUntilISO(report),
+      });
+    }
+
+    const { qr_token } = req.body || {};
+    if (!qr_token) {
+      return res.status(400).json({ message: "qr_token requis." });
+    }
+
+    const { student, attendee } = await resolveQrToAttendee(report, qr_token);
+
+    // Idempotent : déjà présent → retourne sans modifier
+    if (attendee.status === "present") {
+      return res.json({
+        student: {
+          id: student.id,
+          first_name: student.first_name,
+          last_name: student.last_name,
+          email: student.email,
+        },
+        attendee: {
+          student_id: attendee.student_id,
+          status: attendee.status,
+          marked_at: attendee.marked_at,
+          absence_reason: attendee.absence_reason,
+        },
+        already_present: true,
+        message: `${student.first_name} ${student.last_name} était déjà marqué présent.`,
+      });
+    }
+
+    // Marquer présent
+    const now = new Date();
+    await attendee.update({
+      status: "present",
+      absence_reason: null,
+      marked_at: now,
+    });
+
+    res.json({
+      student: {
+        id: student.id,
+        first_name: student.first_name,
+        last_name: student.last_name,
+        email: student.email,
+      },
+      attendee: {
+        student_id: attendee.student_id,
+        status: attendee.status,
+        marked_at: attendee.marked_at,
+        absence_reason: attendee.absence_reason,
+      },
+      already_present: false,
+      message: `${student.first_name} ${student.last_name} marqué présent.`,
     });
   } catch (err) {
     next(err);
